@@ -3,3 +3,17 @@
 @media(max-width:1500px){.kpi-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.main-grid{grid-template-columns:minmax(0,1fr) 330px}}@media(max-width:1100px){.step-row{grid-template-columns:repeat(2,minmax(0,1fr))}.setup-grid{grid-template-columns:1fr 1fr}.main-grid{grid-template-columns:1fr}.detail{position:static}.kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:680px){.shell{padding:9px 8px 65px}.topbar{flex-wrap:wrap;padding:9px}.logo-name{font-size:18px}.outline-badge{font-size:9px}.top-actions{width:100%;justify-content:space-between;flex-wrap:wrap}.live-chip{flex:1}.setup-grid{grid-template-columns:1fr}.setup-actions{flex-wrap:wrap}.step-row{grid-template-columns:1fr}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.kpi{min-height:123px;padding:12px}.kpi-grid>.kpi:last-child{grid-column:span 2}.kpi-value{font-size:23px}.tabs button{padding:12px 11px}.right-tools{flex:1;width:100%}.right-tools input{flex:1}.day-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bottom{gap:10px}}
 
 .workflow.compact .step-row,.workflow.compact .workflow-bottom{display:none}.workflow.compact .workflow-head{margin-bottom:0}
+
+/* v0.4 clean login front; one-time advanced setup remains available. */
+.welcome-panel[hidden],.workflow[hidden]{display:none!important}
+.welcome-panel{max-width:740px;margin:40px auto 22px;padding:46px 28px;text-align:center;box-shadow:0 16px 55px rgba(0,0,0,.18)}
+.welcome-inner{max-width:540px;margin:auto}.welcome-lock{display:inline-grid;place-items:center;width:56px;height:56px;border-radius:17px;background:#174077;color:#78b8ff;font-size:32px;margin-bottom:13px}
+.welcome-eyebrow{font-weight:800;color:#68a5ff;letter-spacing:2px;font-size:10px;margin:8px 0}
+.welcome-panel h1{margin:12px 0;font-size:clamp(24px,4vw,34px);letter-spacing:-.8px}
+.welcome-panel p{color:#9ebbd9;font-size:13px;line-height:1.8}
+.welcome-google{display:flex;justify-content:center;align-items:center;gap:13px;margin:24px auto 16px;background:#f8fafc;color:#19314f;border:0;border-radius:9px;font-size:16px;font-weight:780;cursor:pointer;padding:14px 25px;min-width:280px;box-shadow:0 5px 18px #0003}
+.welcome-google:hover{background:white;transform:translateY(-1px)}.g-mark{font-weight:900;color:#4285f4;font-size:25px}
+.welcome-hint{font-size:12px!important;color:#8cbff5!important}.welcome-safety{font-size:11px!important;opacity:.8}
+@media(max-width:680px){.welcome-panel{margin:15px 4px;padding:29px 14px}.welcome-google{min-width:0;width:100%}}
+
+.dashboard-body[hidden]{display:none!important}

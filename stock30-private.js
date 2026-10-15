@@ -19,6 +19,7 @@
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
   const CONF_KEY = 'stock30-private-public-oauth-config-v1';
+  const FILE_CACHE_KEY = 'stock30-private-remembered-file-ids-v1';
   let tokenClient = null;
   let tokenExpiry = 0;
   const safeError = e => {
@@ -37,11 +38,14 @@
   }
   function saveConfig(){try{
     let c=configValues();verifyConfig(c);localStorage.setItem(CONF_KEY,JSON.stringify(c));state.config=c;
-    status('연결 설정이 이 브라우저에만 저장됐습니다. 이제 Google 로그인 버튼을 누르세요.');
+    $('settingsPanel').hidden=true;status('최초 연결 설정이 저장됐습니다. Google 계정으로 로그인해 주세요.');
   }catch(e){showError('설정 확인',e)}}
   function bootstrap(){
     try{const saved=JSON.parse(localStorage.getItem(CONF_KEY)||'null');if(saved){verifyConfig(saved);state.config=saved;$('clientId').value=saved.clientId;$('apiKey').value=saved.apiKey;$('projectNumber').value=saved.projectNumber;}}catch(_){/* no config */}
-    $('settingsPanel').hidden=!!state.config;
+    $('settingsPanel').hidden=true;
+    $('welcomeLoginBtn').addEventListener('click',signIn);
+    $('forgetFilesBtn').addEventListener('click',forgetRemembered);
+    $('welcomeHint').textContent=state.config?'Google 계정을 선택하면 이전에 연결했던 MASTER 불러오기를 시도합니다.':'최초 1회: 오른쪽 위 ⚙ 최초 설정에서 웹 연결 정보를 입력해 주세요.';
     $('settingsBtn').addEventListener('click',()=>{$('settingsPanel').hidden=!$('settingsPanel').hidden});
     $('closeSettingsBtn').addEventListener('click',()=>{$('settingsPanel').hidden=true});
     $('toggleConnection').addEventListener('click',()=>{const c=$('workflowSection').classList.toggle('compact');$('toggleConnection').textContent=c?'연결 관리 펼치기':'접기'});
@@ -70,11 +74,16 @@
     ['pickPointerBtn','pickGenerationBtn','pickExtraBtn'].forEach(id=>$(id).disabled=!connected);
     $('loginState').textContent=connected?'연결됨':'대기';
     $('authUser').textContent=connected?`Google: ${state.email || '계정 확인 중'}`:state.mode==='local'?'로컬 파일 읽기 모드':'Google 로그인 필요';
+    $('welcomePanel').hidden=connected||!!state.model;
+    $('workflowSection').hidden=!connected && !state.model;
+    $('welcomeHint').textContent=state.config?'로그인하면 마지막 MASTER 연결을 자동으로 복원합니다.':'최초 1회: ⚙ 최초 설정에서 웹 OAuth 설정을 완료해야 합니다.';
     $('connectionChip').textContent=connected?'● Google Drive 연결됨':state.mode==='local'?'● 로컬 자료 미리보기':'● Drive 미연결';
   }
   async function signIn(){
     try {
-      let c=state.config || configValues();verifyConfig(c);state.config=c;
+      let c=state.config || configValues();
+      try{verifyConfig(c)}catch(e){$('settingsPanel').hidden=false;status('Google 웹 인증은 처음 한 번만 연결해야 합니다. 상단의 설정 칸을 채워주세요.',true);$('settingsPanel').scrollIntoView({behavior:'smooth',block:'center'});return;}
+      state.config=c;
       if(!window.google?.accounts?.oauth2)throw Error('Google Identity Services 로딩 실패. 잠시 후 새로고침해 주세요.');
       // Token model: access token is kept only in memory; no refresh token in public JavaScript.
       if(!tokenClient)tokenClient=google.accounts.oauth2.initTokenClient({
@@ -89,13 +98,18 @@
             const profile=await authFetch('https://www.googleapis.com/oauth2/v3/userinfo');
             if(state.email && state.email!==profile.email)clearData();
             state.email=profile.email||'';
-            status(`Google 인증 완료 (${state.email || '계정'}). MASTER 포인터 파일을 선택해 주세요.`);
-          }catch(e){state.token='';tokenExpiry=0;showError('Google 계정 확인',e)}
+            updateConnection();
+            status(`Google 로그인 완료 (${state.email || '계정'}). 기억한 MASTER 연결을 확인하고 있습니다...`);
+            await restoreRememberedFiles();
+          }catch(e){
+            if(!state.email){state.token='';tokenExpiry=0;showError('Google 계정 확인',e);}
+            else showError('MASTER 자동 불러오기',e);
+          }
           updateConnection();
         },
         error_callback:er=>status(`Google 로그인 창 오류: ${String(er.type||'unknown')}`,true)
       });
-      tokenClient.requestAccessToken({prompt:'select_account consent'});
+      tokenClient.requestAccessToken({prompt:'select_account'});
     }catch(e){showError('Google 로그인 준비',e)}
   }
   function signOut(){
@@ -147,10 +161,56 @@
       if(kind!=='extra' && inferred!==kind)throw Error(`잘못 선택된 파일입니다. 기대: ${kind==='masterPointer'?'master_current.json':'master21_generation_*.json'}`);
       if(kind==='extra' && !['lock','scoreSnapshot'].includes(inferred))throw Error('공식 선정 LOCK 또는 학습 점수 스냅샷 JSON을 선택해 주세요.');
       const type=kind==='extra'?inferred:kind;
-      state.files[type]=json;state.fileIds[type]=id;state.mode='drive';
       if(type==='masterPointer' && name && name!=='master_current.json')throw Error('포인터 파일명이 master_current.json이 아닙니다.');
-      assemble();status(`${name||type} 읽기 PASS. ${state.model?'검증된 MASTER 표시 중':'다음 필수 파일을 선택해 주세요.'}`);
+      state.files[type]=json;state.fileIds[type]=id;state.mode='drive';
+      assemble();rememberFiles();
+      if(type==='masterPointer' && !state.model)status('MASTER 포인터 PASS. 검증 생성본을 한 번 선택해 주세요.');
+      else status(`${name||type} 읽기 PASS. ${state.model?'검증된 MASTER 표시 중':'다음 필수 파일을 선택해 주세요.'}`);
     }catch(e){state.model=null;renderAll();showError('Drive 파일 조회',e)}
+  }
+  function rememberFiles(){
+    if(!state.email||state.mode!=='drive')return;
+    try{localStorage.setItem(FILE_CACHE_KEY,JSON.stringify({email:state.email,ids:{...state.fileIds},savedAt:new Date().toISOString()}))}
+    catch(_){status('이 브라우저에서 파일 연결 기억을 저장하지 못했습니다. 다음 방문 시 다시 선택해야 할 수 있습니다.',true)}
+  }
+  function forgetRemembered(){
+    try{localStorage.removeItem(FILE_CACHE_KEY)}catch(_){}
+    status('이 기기에 저장된 파일 연결 기록을 지웠습니다. 다음 방문 시 파일을 다시 선택해 주세요.');
+  }
+  async function restoreRememberedFiles(){
+    let cached=null;
+    try{cached=JSON.parse(localStorage.getItem(FILE_CACHE_KEY)||'null')}catch(_){}
+    if(!cached || cached.email!==state.email || !cached.ids?.masterPointer){
+      status('로그인 완료. 처음 한 번만 「MASTER 포인터」와 「검증 생성본」을 선택해 주세요. 이후에는 자동 불러오기를 시도합니다.');
+      return;
+    }
+    const fetchId=async id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
+    let pointer;
+    try{pointer=await fetchId(cached.ids.masterPointer)}
+    catch(e){status('저장된 MASTER 포인터의 Drive 접근이 거부됐습니다. 「MASTER 포인터」를 다시 선택해 주세요.',true);return}
+    if(detectType(pointer)!=='masterPointer'||pointer.validation_status!=='PASS'){
+      status('저장된 MASTER 포인터가 검증된 형식이 아닙니다. 파일을 다시 선택해 주세요.',true);return;
+    }
+    state.files.masterPointer=pointer;state.fileIds.masterPointer=cached.ids.masterPointer;
+    const latestId=pointer.location;
+    if(!latestId || !/^[A-Za-z0-9_-]{10,}$/.test(latestId)){
+      status('MASTER 포인터 안에 유효한 generation 파일 ID가 없습니다.',true);return;
+    }
+    let generation;
+    try{generation=await fetchId(latestId)}catch(e){
+      status('새 MASTER generation에 아직 웹 권한이 없습니다. 「검증 생성본」을 눌러 최신 파일을 한 번 선택해 주세요. (Windows가 새로 생성한 파일은 drive.file 권한에 자동 추가되지 않을 수 있습니다.)',true);
+      return;
+    }
+    if(detectType(generation)!=='generation'){
+      status('최신 generation 형식을 확인할 수 없습니다. 파일 재선택이 필요합니다.',true);return;
+    }
+    state.files.generation=generation;state.fileIds.generation=latestId;
+    for(const type of ['lock','scoreSnapshot']){
+      const id=cached.ids[type];if(!id)continue;
+      try{const extra=await fetchId(id);if(detectType(extra)===type){state.files[type]=extra;state.fileIds[type]=id;}}catch(_){/* Optional extra is not required for MASTER. */}
+    }
+    state.mode='drive';assemble();rememberFiles();
+    status(`Google 로그인 PASS · 검증 MASTER ${pointer.as_of} 자동 불러오기 PASS · ${state.model?.db.length||0}건`);
   }
   function detectType(a){
     if(!a||typeof a!=='object')return null;
@@ -267,7 +327,7 @@
   }
   function renderContent(){
     renderFilters();const m=state.model;
-    if(!m){$('content').innerHTML=`<div class="empty"><strong>비공개 MASTER 연결 대기</strong>Google 로그인 → master_current.json 선택 → generation 파일 선택 순서로 진행해 주세요.<br>로컬 JSON을 선택해도 데이터는 브라우저 밖으로 전송되지 않습니다.</div>`;return}
+    if(!m){$('content').innerHTML=`<div class="empty"><strong>비공개 MASTER 연결 대기</strong>로그인 후 처음 한 번만 MASTER 파일 연결을 승인해 주세요. 이후에는 자동 복원을 시도합니다.<br>로컬 JSON을 선택해도 데이터는 브라우저 밖으로 전송되지 않습니다.</div>`;return}
     if(state.tab==='stocks')return renderStocks();
     if(state.tab==='reasons')return renderReasons();
     if(state.tab==='top5')return renderTop5();
@@ -304,6 +364,7 @@
     return `<svg viewBox="0 0 310 165" role="img" aria-label="검증 일별 종가 추세"><line x1="25" y1="30" x2="290" y2="30" stroke="#263b55"/><line x1="25" y1="84" x2="290" y2="84" stroke="#263b55"/><line x1="25" y1="137" x2="290" y2="137" stroke="#263b55"/><polyline points="${poly}" fill="none" stroke="#4897ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${xy.map(p=>`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#6cb4ff"/>`).join('')}<text x="20" y="17" fill="#8db2d7" font-size="10">${h(comma(hi))}</text><text x="20" y="155" fill="#8db2d7" font-size="10">${h(comma(lo))}</text></svg>`;
   }
   function renderAll(){
+    $('dashboardBody').hidden=!state.model;
     document.querySelectorAll('#tabs [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab));
     summary();renderContent();renderDetail();
     const m=state.model;
