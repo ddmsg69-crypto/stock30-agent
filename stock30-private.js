@@ -18,6 +18,10 @@
     model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:''
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
+  // Public web-OAuth client identifier (not a credential). Never embed secrets or access tokens.
+  const WEB_CLIENT_ID = '630353141400-muc7pvh4q1hg793t221m3kpqq27h098e.apps.googleusercontent.com';
+  // The numeric prefix normally corresponds to the Cloud project number; verify in Cloud Console before Picker setup.
+  const SUGGESTED_PROJECT_NUMBER = '630353141400';
   const CONF_KEY = 'stock30-private-public-oauth-config-v1';
   const FILE_CACHE_KEY = 'stock30-private-remembered-file-ids-v1';
   let tokenClient = null;
@@ -30,22 +34,32 @@
   function status(text,bad=false){$('dataStatus').textContent=text;$('dataStatus').className=bad?'negative':'';}
   function showError(label,e){$('workflowSection').classList.remove('compact');$('toggleConnection').textContent='접기';status(`${label}: ${safeError(e)}`,true);}
   function isValidClientId(s){return /^\d+-[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com$/.test(s);}
-  function configValues(){return {clientId:$('clientId').value.trim(),apiKey:$('apiKey').value.trim(),projectNumber:$('projectNumber').value.trim()};}
-  function verifyConfig(conf){
-    if(!isValidClientId(conf.clientId))throw Error('웹용 OAuth 클라이언트 ID 형식을 확인해 주세요.');
-    if(!/^AIza[\w-]{20,}$/.test(conf.apiKey))throw Error('브라우저 API 키 형식을 확인해 주세요.');
-    if(!/^\d{6,20}$/.test(conf.projectNumber))throw Error('Google Cloud 프로젝트 번호는 숫자여야 합니다.');
+  function configValues(){return {clientId:WEB_CLIENT_ID,apiKey:$('apiKey').value.trim(),projectNumber:$('projectNumber').value.trim() || SUGGESTED_PROJECT_NUMBER};}
+  function verifyOAuthClient(conf){
+    if(!isValidClientId(conf?.clientId))throw Error('웹용 OAuth 클라이언트 ID 형식을 확인해 주세요.');
+  }
+  function verifyPickerConfig(conf){
+    verifyOAuthClient(conf);
+    if(!/^AIza[\w-]{20,}$/.test(conf.apiKey||''))throw Error('Google Picker 연결용 API 키가 필요합니다. ⚙ 연결 관리에서 API 키를 등록해 주세요.');
+    if(!/^\d{6,20}$/.test(conf.projectNumber||''))throw Error('Google Cloud 프로젝트 번호를 확인해 주세요.');
   }
   function saveConfig(){try{
-    let c=configValues();verifyConfig(c);localStorage.setItem(CONF_KEY,JSON.stringify(c));state.config=c;
-    $('settingsPanel').hidden=true;status('최초 연결 설정이 저장됐습니다. Google 계정으로 로그인해 주세요.');
+    let c=configValues();verifyPickerConfig(c);localStorage.setItem(CONF_KEY,JSON.stringify(c));state.config=c;
+    $('settingsPanel').hidden=true;status('Google Picker 설정을 저장했습니다. 로그인 상태라면 MASTER 파일을 선택할 수 있습니다.');
   }catch(e){showError('설정 확인',e)}}
   function bootstrap(){
-    try{const saved=JSON.parse(localStorage.getItem(CONF_KEY)||'null');if(saved){verifyConfig(saved);state.config=saved;$('clientId').value=saved.clientId;$('apiKey').value=saved.apiKey;$('projectNumber').value=saved.projectNumber;}}catch(_){/* no config */}
+    // Google login works immediately with the public client ID; Picker credentials are optional until file selection.
+    let saved=null;
+    try{saved=JSON.parse(localStorage.getItem(CONF_KEY)||'null')}catch(_){/* ignore invalid settings */}
+    state.config={clientId:WEB_CLIENT_ID,apiKey:saved?.apiKey||'',projectNumber:saved?.projectNumber||SUGGESTED_PROJECT_NUMBER};
+    $('clientId').value=WEB_CLIENT_ID;
+    $('clientId').readOnly=true;
+    $('apiKey').value=state.config.apiKey;
+    $('projectNumber').value=state.config.projectNumber;
     $('settingsPanel').hidden=true;
     $('welcomeLoginBtn').addEventListener('click',signIn);
     $('forgetFilesBtn').addEventListener('click',forgetRemembered);
-    $('welcomeHint').textContent=state.config?'Google 계정을 선택하면 이전에 연결했던 MASTER 불러오기를 시도합니다.':'최초 1회: 오른쪽 위 ⚙ 최초 설정에서 웹 연결 정보를 입력해 주세요.';
+    $('welcomeHint').textContent='Google 계정을 선택해 로그인할 수 있습니다. 첫 MASTER 연결 시에는 파일 접근을 한 번 승인해야 합니다.';
     $('settingsBtn').addEventListener('click',()=>{$('settingsPanel').hidden=!$('settingsPanel').hidden});
     $('closeSettingsBtn').addEventListener('click',()=>{$('settingsPanel').hidden=true});
     $('toggleConnection').addEventListener('click',()=>{const c=$('workflowSection').classList.toggle('compact');$('toggleConnection').textContent=c?'연결 관리 펼치기':'접기'});
@@ -76,13 +90,13 @@
     $('authUser').textContent=connected?`Google: ${state.email || '계정 확인 중'}`:state.mode==='local'?'로컬 파일 읽기 모드':'Google 로그인 필요';
     $('welcomePanel').hidden=connected||!!state.model;
     $('workflowSection').hidden=!connected && !state.model;
-    $('welcomeHint').textContent=state.config?'로그인하면 마지막 MASTER 연결을 자동으로 복원합니다.':'최초 1회: ⚙ 최초 설정에서 웹 OAuth 설정을 완료해야 합니다.';
+    $('welcomeHint').textContent='Google 계정 로그인 · 비공개 MASTER는 파일 접근을 승인한 뒤에만 읽습니다.';
     $('connectionChip').textContent=connected?'● Google Drive 연결됨':state.mode==='local'?'● 로컬 자료 미리보기':'● Drive 미연결';
   }
   async function signIn(){
     try {
-      let c=state.config || configValues();
-      try{verifyConfig(c)}catch(e){$('settingsPanel').hidden=false;status('Google 웹 인증은 처음 한 번만 연결해야 합니다. 상단의 설정 칸을 채워주세요.',true);$('settingsPanel').scrollIntoView({behavior:'smooth',block:'center'});return;}
+      const c=state.config || configValues();
+      verifyOAuthClient(c);
       state.config=c;
       if(!window.google?.accounts?.oauth2)throw Error('Google Identity Services 로딩 실패. 잠시 후 새로고침해 주세요.');
       // Token model: access token is kept only in memory; no refresh token in public JavaScript.
@@ -135,7 +149,7 @@
   }
   async function openPicker(kind){
     try{
-      const cfg=state.config;verifyConfig(cfg);
+      const cfg=state.config;verifyPickerConfig(cfg);
       if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();throw Error('Google 로그인부터 다시 진행해 주세요.');}
       await loadPicker();
       const view=new google.picker.DocsView(google.picker.ViewId.DOCS).setIncludeFolders(true).setSelectFolderEnabled(false).setMode(google.picker.DocsViewMode.LIST);
@@ -181,7 +195,7 @@
     let cached=null;
     try{cached=JSON.parse(localStorage.getItem(FILE_CACHE_KEY)||'null')}catch(_){}
     if(!cached || cached.email!==state.email || !cached.ids?.masterPointer){
-      status('로그인 완료. 처음 한 번만 「MASTER 포인터」와 「검증 생성본」을 선택해 주세요. 이후에는 자동 불러오기를 시도합니다.');
+      status(state.config.apiKey ? 'Google 로그인 완료. 처음 한 번만 MASTER 포인터와 검증 생성본을 선택해 주세요. 이후에는 자동 불러오기를 시도합니다.' : 'Google 로그인 완료! 비공개 MASTER를 처음 연결하려면 ⚙ 연결 관리에서 Google Picker API 키를 1회 등록해 주세요.');
       return;
     }
     const fetchId=async id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);

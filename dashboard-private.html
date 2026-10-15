@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <meta name="description" content="Stock30 System 개인용 읽기 전용 Google Drive MASTER 대시보드">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://accounts.google.com https://apis.google.com https://www.gstatic.com; style-src 'self'; connect-src https://www.googleapis.com https://openidconnect.googleapis.com https://oauth2.googleapis.com; frame-src https://accounts.google.com https://drive.google.com https://docs.google.com https://*.google.com https://*.googleusercontent.com; img-src 'self' data: https://*.googleusercontent.com; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests">
-<title>Stock30 System — Private Data Terminal v0.4</title>
+<title>Stock30 System — Private Data Terminal v0.5</title>
 <link rel="stylesheet" href="./stock30-private.css">
 <script defer src="https://accounts.google.com/gsi/client"></script>
 <script defer src="https://apis.google.com/js/api.js"></script>
@@ -14,24 +14,24 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="logo"><span class="logo-bars"><i></i><i></i><i></i><i></i></span><span class="logo-name">Stock30 System</span><span class="outline-badge">PRIVATE DATA · v0.4</span></div>
-  <div class="top-actions"><span class="live-chip" id="connectionChip">● Drive 미연결</span><button class="top-control" id="settingsBtn" type="button">⚙ 최초 설정</button><button class="top-control primary" id="loginBtn" type="button">Google 계정으로 로그인</button><button class="top-control" id="logoutBtn" type="button" disabled>로그아웃</button></div>
+  <div class="logo"><span class="logo-bars"><i></i><i></i><i></i><i></i></span><span class="logo-name">Stock30 System</span><span class="outline-badge">PRIVATE DATA · v0.5</span></div>
+  <div class="top-actions"><span class="live-chip" id="connectionChip">● Drive 미연결</span><button class="top-control" id="settingsBtn" type="button">⚙ 연결 관리</button><button class="top-control primary" id="loginBtn" type="button">Google 계정으로 로그인</button><button class="top-control" id="logoutBtn" type="button" disabled>로그아웃</button></div>
 </header>
 <main class="shell">
   <section class="welcome-panel card" id="welcomePanel" aria-label="Stock30 Google 로그인">
     <div class="welcome-inner"><span class="welcome-lock">✦</span><p class="welcome-eyebrow">STOCK30 PRIVATE TERMINAL</p>
-    <h1>Google 계정으로 시작하세요</h1><p>Google 공식 로그인 화면에서 계정을 선택하면, 마지막으로 연결한 비공개 MASTER를 자동으로 불러옵니다.</p>
+    <h1>Google 계정으로 시작하세요</h1><p>Google 공식 화면에서 계정을 선택하세요. 이미 연결한 MASTER는 접근 권한이 유효한 경우 자동으로 불러옵니다.</p>
     <button type="button" id="welcomeLoginBtn" class="welcome-google"><span class="g-mark">G</span> Google 계정으로 로그인</button>
-    <p class="welcome-hint" id="welcomeHint">처음 사용 시 웹 인증 연결 설정을 한 번만 완료하면 됩니다.</p>
+    <p class="welcome-hint" id="welcomeHint">Google 로그인은 바로 가능해요. 최초 MASTER 파일 선택 시 Picker 설정이 필요할 수 있어요.</p>
     <p class="welcome-safety">비밀번호는 Google에만 입력합니다. MASTER와 인증 토큰은 공개 저장소에 올리지 않습니다.</p></div>
   </section>
   <div class="notice" id="securityNotice">🔒 <strong>개인 데이터 보호:</strong> 이 GitHub Pages는 공개 웹페이지지만 MASTER 파일은 공개하지 않습니다. Google 인증과 사용자가 선택한 Drive 파일 권한이 있어야 원본을 읽을 수 있습니다. 이 페이지는 파일 읽기(GET)만 수행합니다. Google이 제공하는 drive.file 범위에는 수정 권한도 포함될 수 있어 동의 내용을 확인해 주세요. 이 기기는 연결 파일의 ID만 기억할 수 있습니다. 실시간 시세는 아직 미연결입니다.</div>
   <section class="setup-panel card" id="settingsPanel" hidden>
-    <div class="setup-title"><div><h2>Google Drive 개인 연결</h2><p>최초 1회 웹용 Google OAuth와 Picker를 설정합니다. Windows Desktop OAuth와 기존 MASTER는 변경하지 않습니다. 비밀번호를 여기에 입력하지 않습니다.</p></div><button type="button" class="quiet-btn" id="closeSettingsBtn">접기 ×</button></div>
+    <div class="setup-title"><div><h2>Google Drive 개인 연결</h2><p>웹 Google 로그인 ID는 이미 설정됐습니다. 최초 비공개 MASTER 선택에 필요한 Google Picker API 키만 입력합니다. Windows Desktop OAuth·MASTER는 변경하지 않습니다.</p></div><button type="button" class="quiet-btn" id="closeSettingsBtn">접기 ×</button></div>
     <div class="setup-grid">
-      <label>웹 OAuth 클라이언트 ID <span class="hint">(공개 식별자)</span><input id="clientId" type="text" autocomplete="off" spellcheck="false" placeholder="...apps.googleusercontent.com"></label>
+      <label>웹 OAuth 클라이언트 ID <span class="hint">(자동 설정 완료 · 읽기 전용)</span><input id="clientId" type="text" autocomplete="off" spellcheck="false" placeholder="...apps.googleusercontent.com"></label>
       <label>HTTP 참조 제한된 브라우저 API 키<input id="apiKey" type="text" autocomplete="off" spellcheck="false" placeholder="Google Picker API 키"></label>
-      <label>Google Cloud 프로젝트 번호<input id="projectNumber" type="text" autocomplete="off" inputmode="numeric" placeholder="숫자 프로젝트 번호"></label>
+      <label>Google Cloud 프로젝트 번호 (확인 필요)<input id="projectNumber" type="text" autocomplete="off" inputmode="numeric" placeholder="숫자 프로젝트 번호"></label>
     </div>
     <div class="setup-actions"><button class="primary-btn" type="button" id="saveConfigBtn">설정 저장 (이 브라우저만)</button><span class="small-note">토큰·MASTER 내용은 브라우저 저장소에 보관하지 않습니다. 편의를 위해 연결 파일 ID만 이 기기에 저장할 수 있습니다. 공개 저장소에는 실제 데이터가 없습니다.</span></div>
   </section>
@@ -43,7 +43,7 @@
       <div class="step"><span class="step-number">3</span><div><b>검증 생성본</b><small>master21_generation_*.json</small></div><button class="thin-btn" type="button" id="pickGenerationBtn" disabled>Drive에서 선택</button></div>
       <div class="step"><span class="step-number">4</span><div><b>보조 데이터</b><small>공식 LOCK / 점수 스냅샷</small></div><button class="thin-btn" type="button" id="pickExtraBtn" disabled>선택 (선택사항)</button></div>
     </div>
-    <div class="workflow-bottom"><div id="dataStatus" aria-live="polite">Google 로그인 후 최초 1회 MASTER 포인터와 검증 생성본을 선택하면 다음 로그인부터 자동 불러오기를 시도합니다.</div><label class="upload-label">로컬 파일로 미리 확인<input id="localImport" type="file" accept=".json,application/json" multiple></label><button type="button" class="quiet-btn" id="clearBtn">현재 화면 지우기</button><button type="button" class="quiet-btn" id="forgetFilesBtn">기억한 연결 지우기</button></div>
+    <div class="workflow-bottom"><div id="dataStatus" aria-live="polite">Google 로그인부터 시작하세요. 최초 1회 Drive 파일 권한을 승인하면 다음 접속 시 자동 불러오기를 시도합니다.</div><label class="upload-label">로컬 파일로 미리 확인<input id="localImport" type="file" accept=".json,application/json" multiple></label><button type="button" class="quiet-btn" id="clearBtn">현재 화면 지우기</button><button type="button" class="quiet-btn" id="forgetFilesBtn">기억한 연결 지우기</button></div>
   </section>
   <div class="dashboard-body" id="dashboardBody" hidden>
   <div class="kpi-grid" id="summary" aria-label="검증 성과 개요"></div>
