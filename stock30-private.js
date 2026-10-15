@@ -14,7 +14,7 @@
   const k = (obj,key) => obj && Object.prototype.hasOwnProperty.call(obj,key) ? obj[key] : undefined;
   const EMPTY = Object.freeze({masterPointer:null,generation:null,lock:null,scoreSnapshot:null});
   const state = {
-    token:'',email:'',config:null,pickerLoaded:false,files:{...EMPTY},fileIds:{},mode:'none',
+    token:'',email:'',config:null,pickerLoaded:false,files:{...EMPTY},fileIds:{},mode:'none',refreshing:false,
     model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:''
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
@@ -67,6 +67,8 @@
     $('loginBtn').addEventListener('click',signIn);
     $('logoutBtn').addEventListener('click',signOut);
     $('pickPointerBtn').addEventListener('click',()=>openPicker('masterPointer'));
+    $('refreshMasterBtn').addEventListener('click',()=>refreshCurrentMaster(true));
+    setInterval(()=>{if(state.token&&state.mode==='drive'&&state.model&&document.visibilityState==='visible')refreshCurrentMaster(false)},300000);
     $('pickGenerationBtn').addEventListener('click',()=>openPicker('generation'));
     $('pickExtraBtn').addEventListener('click',()=>openPicker('extra'));
     $('localImport').addEventListener('change',localImport);
@@ -226,6 +228,32 @@
     state.mode='drive';assemble();rememberFiles();
     status(`Google 로그인 PASS · 검증 MASTER ${pointer.as_of} 자동 불러오기 PASS · ${state.model?.db.length||0}건`);
   }
+  // Read-only latest pointer check. Never overwrite the displayed model until full validation passes.
+  // Google drive.file may require a one-time Picker grant for each newly published generation.
+  async function refreshCurrentMaster(manual=false){
+    if(state.refreshing)return;
+    if(!state.token||Date.now()>=tokenExpiry){if(manual)status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);return;}
+    if(!state.fileIds.masterPointer){if(manual)status('MASTER 포인터부터 선택해 주세요.',true);return;}
+    state.refreshing=true;
+    try{
+      const pointer=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.fileIds.masterPointer)}?alt=media`);
+      if(detectType(pointer)!=='masterPointer'||pointer.validation_status!=='PASS')throw Error('최신 포인터 검증 PASS가 아닙니다.');
+      if(state.model&&pointer.generation===state.model.pointer.generation){if(manual)status(`MASTER 최신 확인 · ${pointer.as_of} · ${state.model.db.length}건`);return;}
+      if(!/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('generation 파일 ID가 잘못됐습니다.');
+      let generation;
+      try{generation=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(pointer.location)}?alt=media`);}
+      catch(e){status(`새 MASTER ${pointer.as_of}가 게시됐지만 파일 접근 승인이 필요합니다. 3번 검증 생성본에서 새 파일을 선택해 주세요. 기존 화면은 유지됩니다.`,true);return;}
+      if(detectType(generation)!=='generation')throw Error('generation 형식 오류');
+      const files=state.files,ids=state.fileIds,model=state.model;
+      try{
+        state.files={...files,masterPointer:pointer,generation};
+        state.fileIds={...ids,generation:pointer.location};
+        assemble();rememberFiles();
+        status(`MASTER 최신화 PASS · ${pointer.as_of} · ${state.model.db.length}건`);
+      }catch(e){state.files=files;state.fileIds=ids;state.model=model;renderAll();throw e;}
+    }catch(e){status(`최신 MASTER 확인 실패: ${safeError(e)} · 기존 화면 유지`,true);}
+    finally{state.refreshing=false;}
+  }
   function detectType(a){
     if(!a||typeof a!=='object')return null;
     if(a.kind==='MASTER21_CURRENT'&&typeof a.location==='string'&&a.files)return 'masterPointer';
@@ -257,7 +285,7 @@
     if(!p||!g){state.model=null;renderAll();return}
     if(p.validation_status!=='PASS'||g.validation_status!=='PASS')throw Error('검증 PASS가 아닌 MASTER는 사용할 수 없습니다.');
     if(g.sha256!==p.generation)throw Error('MASTER 포인터와 generation 해시 식별자가 불일치합니다.');
-    if(state.fileIds.generation && p.location!==state.fileIds.generation)throw Error('선택한 generation 파일이 current pointer가 가리키는 파일과 다릅니다.');
+    if(state.fileIds.generation && p.location!==state.fileIds.generation)throw Error('generation과 포인터가 다릅니다. 최신 MASTER 포인터를 다시 선택해 주세요.');
     if(p.schema_version!=='2.1'||g.schema_version!=='2.1')throw Error('MASTER 2.1 형식이 아닙니다.');
     if(p.PRICE_POLICY_VERSION!==g.PRICE_POLICY_VERSION)throw Error('MASTER 가격 정책 버전이 일치하지 않습니다.');
     const master=safeParse(g.files['master_state.json'],'master_state.json');

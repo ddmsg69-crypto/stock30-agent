@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="dark">
 <meta name="description" content="Stock30 System 개인용 읽기 전용 Google Drive MASTER 대시보드">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://accounts.google.com https://apis.google.com https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://www.gstatic.com; connect-src https://www.googleapis.com https://openidconnect.googleapis.com https://oauth2.googleapis.com; frame-src https://accounts.google.com https://drive.google.com https://docs.google.com https://*.google.com https://*.googleusercontent.com; img-src 'self' data: https://*.googleusercontent.com https://www.gstatic.com https://ssl.gstatic.com https://*.google.com; font-src 'self' https://fonts.gstatic.com; object-src 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests">
-<title>Stock30 System — Private Data Terminal v0.5.1</title>
+<title>Stock30 System — Private Data Terminal v0.6</title>
 <link rel="stylesheet" href="./stock30-private.css">
 <script defer src="https://accounts.google.com/gsi/client"></script>
 <script defer src="https://apis.google.com/js/api.js"></script>
@@ -14,7 +14,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="logo"><span class="logo-bars"><i></i><i></i><i></i><i></i></span><span class="logo-name">Stock30 System</span><span class="outline-badge">PRIVATE DATA · v0.5.1</span></div>
+  <div class="logo"><span class="logo-bars"><i></i><i></i><i></i><i></i></span><span class="logo-name">Stock30 System</span><span class="outline-badge">PRIVATE DATA · v0.6</span></div>
   <div class="top-actions"><span class="live-chip" id="connectionChip">● Drive 미연결</span><button class="top-control" id="settingsBtn" type="button">⚙ 연결 관리</button><button class="top-control primary" id="loginBtn" type="button">Google 계정으로 로그인</button><button class="top-control" id="logoutBtn" type="button" disabled>로그아웃</button></div>
 </header>
 <main class="shell">
@@ -41,9 +41,9 @@
       <div class="step"><span class="step-number">1</span><div><b>Google 인증</b><small>본인 Drive 권한</small></div><span class="step-state" id="loginState">대기</span></div>
       <div class="step"><span class="step-number">2</span><div><b>MASTER 포인터</b><small>master_current.json</small></div><button class="thin-btn" type="button" id="pickPointerBtn" disabled>Drive에서 선택</button></div>
       <div class="step"><span class="step-number">3</span><div><b>검증 생성본</b><small>master21_generation_*.json</small></div><button class="thin-btn" type="button" id="pickGenerationBtn" disabled>Drive에서 선택</button></div>
-      <div class="step"><span class="step-number">4</span><div><b>보조 데이터</b><small>공식 LOCK / 점수 스냅샷</small></div><button class="thin-btn" type="button" id="pickExtraBtn" disabled>선택 (선택사항)</button></div>
+      <div class="step"><span class="step-number">4</span><div><b>보조 데이터</b><small>공식 LOCK / 차트·모멘텀 점수 JSON</small></div><button class="thin-btn" type="button" id="pickExtraBtn" disabled>선택 (선택사항)</button></div>
     </div>
-    <div class="workflow-bottom"><div id="dataStatus" aria-live="polite">Google 로그인부터 시작하세요. 최초 1회 Drive 파일 권한을 승인하면 다음 접속 시 자동 불러오기를 시도합니다.</div><label class="upload-label">로컬 파일로 미리 확인<input id="localImport" type="file" accept=".json,application/json" multiple></label><button type="button" class="quiet-btn" id="clearBtn">현재 화면 지우기</button><button type="button" class="quiet-btn" id="forgetFilesBtn">기억한 연결 지우기</button></div>
+    <div class="workflow-bottom"><div id="dataStatus" aria-live="polite">Google 로그인부터 시작하세요. 최초 1회 Drive 파일 권한을 승인하면 다음 접속 시 자동 불러오기를 시도합니다.</div><button type="button" class="thin-btn" id="refreshMasterBtn">↻ 최신 MASTER 확인</button><label class="upload-label">로컬 파일로 미리 확인<input id="localImport" type="file" accept=".json,application/json" multiple></label><button type="button" class="quiet-btn" id="clearBtn">현재 화면 지우기</button><button type="button" class="quiet-btn" id="forgetFilesBtn">기억한 연결 지우기</button></div>
   </section>
   <div class="dashboard-body" id="dashboardBody" hidden>
   <div class="kpi-grid" id="summary" aria-label="검증 성과 개요"></div>
