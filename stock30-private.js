@@ -24,12 +24,19 @@
   const SUGGESTED_PROJECT_NUMBER = '630353141400';
   const CONF_KEY = 'stock30-private-public-oauth-config-v1';
   const FILE_CACHE_KEY = 'stock30-private-remembered-file-ids-v1';
+  const SCORE_FOLDER_ID = '13HZpgafKCULsHkKfnhGiohUWbgDzGOXV';
+  const SCORE_FILENAME = /^Stock30_LEARNING_SCORE_SNAPSHOT_.*\.json$/;
+  const SCORE_DEFINITIONS = Object.freeze({chart_technical_score_100:'score',momentum_score_100:'short_momentum',volume_score_100:'relative_volume',candle_score_100:'candle_strength',close_position_score_100:'close_position',breakout_position_score_100:'breakout_position',session_strength_score_100:'session_strength'});
+  const newScoreSession = () => ({cache:new Map(),documents:[],scanDocuments:null,folderOK:false,inflight:null,lastScan:0,checkedAt:'',status:'미연결',message:'MASTER 연결 후 허용된 점수 스냅샷을 확인합니다.'});
+  let scoreSession = newScoreSession();
+  let masterRequest = 0;
+  let pendingPointer = null;
   let tokenClient = null;
   let tokenExpiry = 0;
   const safeError = e => {
     const raw = String(e && e.message || e || '알 수 없는 오류');
     // Never leak bearer tokens, Google API keys or large provider response payloads to page/log.
-    return raw.slice(0,250).replace(/ya29\.[a-z0-9._-]+/gi,'[REDACTED]');
+    return raw.slice(0,250).replace(/ya29\.[a-z0-9._-]+/gi,'[REDACTED]').replace(/AIza[\w-]{20,}/g,'[REDACTED]');
   };
   function status(text,bad=false){$('dataStatus').textContent=text;$('dataStatus').className=bad?'negative':'';}
   function showError(label,e){$('workflowSection').classList.remove('compact');$('toggleConnection').textContent='접기';status(`${label}: ${safeError(e)}`,true);}
@@ -68,7 +75,7 @@
     $('logoutBtn').addEventListener('click',signOut);
     $('pickPointerBtn').addEventListener('click',()=>openPicker('masterPointer'));
     $('refreshMasterBtn').addEventListener('click',()=>refreshCurrentMaster(true));
-    setInterval(()=>{if(state.token&&state.mode==='drive'&&state.model&&document.visibilityState==='visible')refreshCurrentMaster(false)},300000);
+    $('retryScoresBtn').addEventListener('click',()=>connectScores(true));
     $('pickGenerationBtn').addEventListener('click',()=>openPicker('generation'));
     $('pickExtraBtn').addEventListener('click',()=>openPicker('extra'));
     $('localImport').addEventListener('change',localImport);
@@ -134,9 +141,9 @@
   }
   async function authFetch(url){
     if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();throw Error('인증이 만료됐습니다. Google에 다시 로그인해 주세요.');}
-    const r=await fetch(url,{headers:{Authorization:`Bearer ${state.token}`},cache:'no-store',redirect:'error'});
-    if(!r.ok)throw Error(`Google API HTTP ${r.status}${r.status===403?' (권한 또는 API 설정 확인)':''}${r.status===404?' (파일 접근 권한/선택 여부 확인)':''}`);
-    return r.json();
+    const r=await fetch(url,{headers:{Authorization:`Bearer ${state.token}`},cache:'no-store',redirect:'error',signal:typeof AbortSignal!=='undefined'?AbortSignal.timeout(15000):undefined});
+    if(!r.ok){const error=Error(`Google API HTTP ${r.status}${r.status===403?' (권한 또는 API 설정 확인)':''}${r.status===404?' (파일 접근 권한/선택 여부 확인)':''}`);error.status=r.status;throw error;}
+    try{return await r.json()}catch(_){throw Error('Google 파일 JSON 형식 확인 필요');}
   }
   async function loadPicker(){
     if(window.google?.picker)return;
@@ -170,20 +177,31 @@
     }catch(e){showError('Google 파일 선택기',e)}
   }
   async function ingestDriveFile(kind,id,name){
+    const session=scoreSession;
     try{
       status(`${name||'선택한 파일'} 읽는 중...`);
-      const json=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
+      const snapshot=kind==='extra' && SCORE_FILENAME.test(name||'');
+      const document=snapshot?await readScoreFile(await scoreMetadata(id),session):null;
+      const json=document?.data||await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
+      ensureSession(session);
       const inferred=detectType(json);
-      if(kind!=='extra' && inferred!==kind)throw Error(`잘못 선택된 파일입니다. 기대: ${kind==='masterPointer'?'master_current.json':'master21_generation_*.json'}`);
-      if(kind==='extra' && !['lock','scoreSnapshot'].includes(inferred))throw Error('공식 선정 LOCK 또는 학습 점수 스냅샷 JSON을 선택해 주세요.');
+      if(kind!=='extra' && inferred!==kind)throw Error('선택한 파일 형식을 확인해 주세요.');
+      if(kind==='extra' && !['lock','scoreSnapshot'].includes(inferred))throw Error('공식 LOCK 또는 학습 점수 JSON을 선택해 주세요.');
       const type=kind==='extra'?inferred:kind;
       if(type==='masterPointer' && name && name!=='master_current.json')throw Error('포인터 파일명이 master_current.json이 아닙니다.');
-      state.files[type]=json;state.fileIds[type]=id;state.mode='drive';
-      assemble();rememberFiles();
-      if(type==='masterPointer' && !state.model)status('MASTER 포인터 PASS. 검증 생성본을 한 번 선택해 주세요.');
-      else status(`${name||type} 읽기 PASS. ${state.model?'검증된 MASTER 표시 중':'다음 필수 파일을 선택해 주세요.'}`);
-    }catch(e){state.model=null;renderAll();showError('Drive 파일 조회',e)}
+      if(type==='masterPointer' && state.model && json.generation!==state.model.pointer.generation){
+        pendingPointer={data:json,id};status('새 MASTER 포인터 확인 · 검증 생성본을 선택해 주세요. 기존 화면은 유지됩니다.');return;
+      }
+      const files={...state.files,[type]:json},ids={...state.fileIds,[type]:id};
+      if(type==='generation' && pendingPointer){files.masterPointer=pendingPointer.data;ids.masterPointer=pendingPointer.id;}
+      const documents=document?session.documents.map(d=>d.id===id?document:d):session.documents;
+      if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';assemble();rememberFiles();updateConnection();status('MASTER 포인터·검증 생성본을 모두 선택해 주세요.');return;}
+      await connectScores(false,{files,ids,mode:'drive',documents});
+      if(state.files.generation===json)pendingPointer=null;
+      status('파일 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
+    }catch(e){if(session===scoreSession){showError('Drive 파일 조회',e);renderAll();}}
   }
+
   function rememberFiles(){
     if(!state.email||state.mode!=='drive')return;
     try{localStorage.setItem(FILE_CACHE_KEY,JSON.stringify({email:state.email,ids:{...state.fileIds},savedAt:new Date().toISOString()}))}
@@ -194,66 +212,44 @@
     status('이 기기에 저장된 파일 연결 기록을 지웠습니다. 다음 방문 시 파일을 다시 선택해 주세요.');
   }
   async function restoreRememberedFiles(){
+    const session=scoreSession;
     let cached=null;
     try{cached=JSON.parse(localStorage.getItem(FILE_CACHE_KEY)||'null')}catch(_){}
-    if(!cached || cached.email!==state.email || !cached.ids?.masterPointer){
-      status(state.config.apiKey ? 'Google 로그인 완료. 처음 한 번만 MASTER 포인터와 검증 생성본을 선택해 주세요. 이후에는 자동 불러오기를 시도합니다.' : 'Google 로그인 완료! 비공개 MASTER를 처음 연결하려면 ⚙ 연결 관리에서 Google Picker API 키를 1회 등록해 주세요.');
-      return;
-    }
-    const fetchId=async id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
-    let pointer;
-    try{pointer=await fetchId(cached.ids.masterPointer)}
-    catch(e){status('저장된 MASTER 포인터의 Drive 접근이 거부됐습니다. 「MASTER 포인터」를 다시 선택해 주세요.',true);return}
-    if(detectType(pointer)!=='masterPointer'||pointer.validation_status!=='PASS'){
-      status('저장된 MASTER 포인터가 검증된 형식이 아닙니다. 파일을 다시 선택해 주세요.',true);return;
-    }
-    state.files.masterPointer=pointer;state.fileIds.masterPointer=cached.ids.masterPointer;
-    const latestId=pointer.location;
-    if(!latestId || !/^[A-Za-z0-9_-]{10,}$/.test(latestId)){
-      status('MASTER 포인터 안에 유효한 generation 파일 ID가 없습니다.',true);return;
-    }
-    let generation;
-    try{generation=await fetchId(latestId)}catch(e){
-      status('새 MASTER generation에 아직 웹 권한이 없습니다. 「검증 생성본」을 눌러 최신 파일을 한 번 선택해 주세요. (Windows가 새로 생성한 파일은 drive.file 권한에 자동 추가되지 않을 수 있습니다.)',true);
-      return;
-    }
-    if(detectType(generation)!=='generation'){
-      status('최신 generation 형식을 확인할 수 없습니다. 파일 재선택이 필요합니다.',true);return;
-    }
-    state.files.generation=generation;state.fileIds.generation=latestId;
+    if(!cached || cached.email!==state.email || !cached.ids?.masterPointer){status('Google 로그인 완료 · MASTER 포인터와 검증 생성본을 선택해 주세요.');return;}
+    const fetchId=id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
+    const pointer=await fetchId(cached.ids.masterPointer);ensureSession(session);
+    if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS' || !/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('저장된 MASTER 포인터 확인 필요');
+    const generation=await fetchId(pointer.location);ensureSession(session);
+    const files={...EMPTY,masterPointer:pointer,generation},ids={masterPointer:cached.ids.masterPointer,generation:pointer.location};
     for(const type of ['lock','scoreSnapshot']){
       const id=cached.ids[type];if(!id)continue;
-      try{const extra=await fetchId(id);if(detectType(extra)===type){state.files[type]=extra;state.fileIds[type]=id;}}catch(_){/* Optional extra is not required for MASTER. */}
+      try{
+        const extra=type==='scoreSnapshot'?(await readScoreFile(await scoreMetadata(id),session)).data:await fetchId(id);
+        ensureSession(session);if(detectType(extra)===type){files[type]=extra;ids[type]=id;}
+      }catch(_){ensureSession(session);/* Optional files never prevent a read-only MASTER view. */}
     }
-    state.mode='drive';assemble();rememberFiles();
-    status(`Google 로그인 PASS · 검증 MASTER ${pointer.as_of} 자동 불러오기 PASS · ${state.model?.db.length||0}건`);
+    await connectScores(false,{files,ids,mode:'drive'});
+    status('MASTER 자동 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
   }
+
   // Read-only latest pointer check. Never overwrite the displayed model until full validation passes.
   // Google drive.file may require a one-time Picker grant for each newly published generation.
   async function refreshCurrentMaster(manual=false){
     if(state.refreshing)return;
-    if(!state.token||Date.now()>=tokenExpiry){if(manual)status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);return;}
+    if(!state.token || Date.now()>=tokenExpiry){if(manual)status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);return;}
     if(!state.fileIds.masterPointer){if(manual)status('MASTER 포인터부터 선택해 주세요.',true);return;}
-    state.refreshing=true;
+    const session=scoreSession;state.refreshing=true;
     try{
-      const pointer=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.fileIds.masterPointer)}?alt=media`);
-      if(detectType(pointer)!=='masterPointer'||pointer.validation_status!=='PASS')throw Error('최신 포인터 검증 PASS가 아닙니다.');
-      if(state.model&&pointer.generation===state.model.pointer.generation){if(manual)status(`MASTER 최신 확인 · ${pointer.as_of} · ${state.model.db.length}건`);return;}
-      if(!/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('generation 파일 ID가 잘못됐습니다.');
-      let generation;
-      try{generation=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(pointer.location)}?alt=media`);}
-      catch(e){status(`새 MASTER ${pointer.as_of}가 게시됐지만 파일 접근 승인이 필요합니다. 3번 검증 생성본에서 새 파일을 선택해 주세요. 기존 화면은 유지됩니다.`,true);return;}
-      if(detectType(generation)!=='generation')throw Error('generation 형식 오류');
-      const files=state.files,ids=state.fileIds,model=state.model;
-      try{
-        state.files={...files,masterPointer:pointer,generation};
-        state.fileIds={...ids,generation:pointer.location};
-        assemble();rememberFiles();
-        status(`MASTER 최신화 PASS · ${pointer.as_of} · ${state.model.db.length}건`);
-      }catch(e){state.files=files;state.fileIds=ids;state.model=model;renderAll();throw e;}
-    }catch(e){status(`최신 MASTER 확인 실패: ${safeError(e)} · 기존 화면 유지`,true);}
-    finally{state.refreshing=false;}
+      const pointer=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.fileIds.masterPointer)}?alt=media`);ensureSession(session);
+      if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS')throw Error('최신 포인터 검증 PASS가 아닙니다.');
+      if(!/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('generation 파일 ID 확인 필요');
+      const generation=state.model?.pointer.generation===pointer.generation?state.files.generation:await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(pointer.location)}?alt=media`);ensureSession(session);
+      await connectScores(manual,{files:{...state.files,masterPointer:pointer,generation},ids:{...state.fileIds,generation:pointer.location},mode:'drive'});
+      status('MASTER·점수 연결 확인 완료 · 연결 보류 시 기존 정상 화면 유지');
+    }catch(e){if(session===scoreSession){status(`최신 MASTER 확인 실패: ${safeError(e)} · 기존 화면 유지`,true);}}
+    finally{if(session===scoreSession)state.refreshing=false;}
   }
+
   function detectType(a){
     if(!a||typeof a!=='object')return null;
     if(a.kind==='MASTER21_CURRENT'&&typeof a.location==='string'&&a.files)return 'masterPointer';
@@ -278,11 +274,125 @@
       status(`${count}개 파일을 이 브라우저 안에서 읽었습니다.${state.model?' 검증된 데이터로 대시보드를 표시합니다.':' MASTER 포인터·생성본 두 파일이 필요합니다.'}`);
     }catch(e){state.model=null;renderAll();showError('로컬 JSON 읽기',e)}finally{event.target.value=''}
   }
-  function clearData(){state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';renderAll();updateConnection()}
+  function clearData(){scoreSession=newScoreSession();masterRequest++;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';renderAll();updateConnection()}
   function safeParse(s,name){try{return JSON.parse(s)}catch(_){throw Error(`${name} 내부 JSON 파싱 실패`)}}
-  function assemble(){
+  function scoreDocuments(files=state.files,ids=state.fileIds,documents=scoreSession.documents){
+    const result=[...documents];
+    if(files.scoreSnapshot && !result.some(d=>ids.scoreSnapshot && d.id===ids.scoreSnapshot))result.push({id:ids.scoreSnapshot||'manual-local',name:scoreSession.cache.get(ids.scoreSnapshot)?.name||'수동 점수 스냅샷',mode:'manual',data:files.scoreSnapshot});
+    return result;
+  }
+  function ensureSession(session){if(session!==scoreSession)throw Error('연결 세션 변경');}
+  async function scoreMetadata(id){return authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?fields=id,name,version,size,modifiedTime&supportsAllDrives=true`);}
+  async function readScoreFile(meta,session=scoreSession){
+    ensureSession(session);
+    const version=String(meta.version||meta.modifiedTime||'');
+    if(!version || Number(meta.size)>15*1024*1024)throw Error('점수 파일 메타데이터 또는 크기 확인 필요');
+    const cached=session.cache.get(meta.id);
+    if(cached?.version===version)return cached;
+    const data=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`);
+    ensureSession(session);
+    const after=await scoreMetadata(meta.id);ensureSession(session);
+    if(String(after.version||after.modifiedTime||'')!==version)throw Error('점수 업로드 진행 중');
+    if(detectType(data)!=='scoreSnapshot' || data.snapshots.some(s=>!s || !Array.isArray(s.records) || s.records.some(r=>!r || typeof r!=='object')))throw Error('점수 파일 업로드 또는 형식 확인 필요');
+    const document={id:meta.id,name:meta.name,version,mode:'auto',data};
+    session.cache.set(meta.id,document);return document;
+  }
+  async function scanScoreFiles(force=false){
+    const session=scoreSession;
+    if(session.inflight)return session.inflight;
+    if(!force && session.lastScan && Date.now()-session.lastScan<60000)return session.scanDocuments||session.documents;
+    session.inflight=(async()=>{
+      if(!session.folderOK){
+        const folder=await authFetch(`https://www.googleapis.com/drive/v3/files/${SCORE_FOLDER_ID}?fields=id,mimeType&supportsAllDrives=true`);ensureSession(session);
+        if(folder.mimeType!=='application/vnd.google-apps.folder')throw Error('점수 폴더 확인 필요');
+        session.folderOK=true;
+      }
+      const metadata=[];let pageToken='';
+      for(let page=0;page<3;page++){
+        const params=new URLSearchParams({q:`'${SCORE_FOLDER_ID}' in parents and trashed = false and name contains 'Stock30_LEARNING_SCORE_SNAPSHOT_'`,fields:'nextPageToken,incompleteSearch,files(id,name,version,size,modifiedTime)',pageSize:'50',spaces:'drive',supportsAllDrives:'true',includeItemsFromAllDrives:'true'});
+        if(pageToken)params.set('pageToken',pageToken);
+        const listed=await authFetch(`https://www.googleapis.com/drive/v3/files?${params}`);ensureSession(session);
+        if(listed.incompleteSearch || !Array.isArray(listed.files))throw Error('점수 폴더 조회 미완료');
+        metadata.push(...listed.files.filter(f=>SCORE_FILENAME.test(f.name||'')));
+        pageToken=listed.nextPageToken||'';if(!pageToken)break;
+      }
+      if(pageToken || metadata.length>40)throw Error('점수 파일 조회 한도 초과 · 수동 선택 필요');
+      const unique=new Map();
+      for(const meta of metadata){if(unique.has(meta.id) && JSON.stringify(unique.get(meta.id))!==JSON.stringify(meta))throw Error('조회 중 파일 메타데이터 변경');unique.set(meta.id,meta);}
+      const documents=[];
+      for(const meta of unique.values()){ensureSession(session);documents.push(await readScoreFile(meta,session));}
+      ensureSession(session);session.lastScan=Date.now();session.scanDocuments=documents;return documents;
+    })();
+    try{return await session.inflight}finally{session.inflight=null}
+  }
+  function previewModel(files,ids,documents){
+    const previous={files:state.files,ids:state.fileIds,model:state.model,cohort:state.selectedCohort,key:state.selectedKey,documents:scoreSession.documents};
+    try{state.files=files;state.fileIds=ids;scoreSession.documents=documents;assemble(false);return state.model}
+    finally{state.files=previous.files;state.fileIds=previous.ids;state.model=previous.model;state.selectedCohort=previous.cohort;state.selectedKey=previous.key;scoreSession.documents=previous.documents;}
+  }
+  function scoreRegression(previous,next){
+    if(!previous)return '';
+    for(const cohort of previous.cohorts){
+      const target=next.cohorts.find(c=>c.date===cohort.date && c.cohortId===cohort.cohortId);
+      if(!target)return '기존 공식 코호트가 새 MASTER에 없음';
+      for(const stock of cohort.stocks){
+        if(!stock.score)continue;
+        const candidate=target.stocks.find(s=>s.code===stock.code);
+        if(!candidate?.score)return candidate?.scoreIssue||'기존 점수 연결 누락';
+        const fields=[...Object.keys(SCORE_DEFINITIONS),'light_rank_score'];
+        if(stock.score.source_pack_declared_sha256!==candidate.score.source_pack_declared_sha256 || fields.some(k=>stock.score.scores?.[k]!==candidate.score.scores?.[k]))return '기존 정상 점수와 새 점수 충돌';
+      }
+    }
+    return '';
+  }
+  function setScoreStatus(status,message){scoreSession.status=status;scoreSession.message=message;renderScoreConnection();}
+  function scoreFailure(error){
+    if(error?.status===403 || error?.status===404)return '폴더 또는 점수 파일 조회 권한 부족 · 권한을 확대하지 않습니다. 보조 데이터에서 수동 선택해 주세요.';
+    if(error?.status===401 || !state.token)return 'Google 인증 확인 필요 · 다시 로그인해 주세요.';
+    return '점수 자동 연결 실패 또는 부분 업로드 · 기존 정상 데이터 유지 · 잠시 후 재시도해 주세요.';
+  }
+  async function connectScores(force=false,proposal=null){
+    const session=scoreSession,request=++masterRequest;
+    const files=proposal?.files||state.files,ids=proposal?.ids||state.fileIds,mode=proposal?.mode||state.mode;
+    if(!files.masterPointer || !files.generation)return;
+    let documents=proposal?.documents||session.documents,error=null;
+    previewModel(files,ids,documents); // Validate MASTER before any score requests.
+    if(mode==='drive' && state.token){
+      setScoreStatus('확인 중','허용된 점수 파일의 연결 상태를 확인하고 있습니다.');
+      try{documents=await scanScoreFiles(force)}catch(e){error=e;}
+    }
+    if(session!==scoreSession || request!==masterRequest)return;
+    session.checkedAt=new Date().toISOString();
+    const candidate=previewModel(files,ids,documents);
+    let issue=scoreRegression(state.model,candidate);
+    if(state.model && state.model.pointer.generation!==candidate.pointer.generation){
+      const before=new Set(state.model.master.locked_selections.map(c=>c.selection_date+'|'+c.cohort_id));
+      const newCohorts=candidate.master.locked_selections.filter(c=>!before.has(c.selection_date+'|'+c.cohort_id));
+      for(const c of newCohorts){const rows=candidate.cohorts.find(x=>x.date===c.selection_date && x.cohortId===c.cohort_id)?.stocks||[];if(rows.length!==30 || rows.some(s=>!s.score))issue='새 공식 MASTER의 점수 스냅샷 준비 대기';}
+    }
+    if(issue){setScoreStatus(/해시/.test(issue)?'해시 불일치':'연결 보류',`${issue} · 기존 정상 데이터 유지`);return;}
+    state.files=files;state.fileIds=ids;state.mode=mode;session.documents=documents;
+    assemble();rememberFiles();updateConnection();
+    const relevant=state.model.cohorts.flatMap(c=>c.stocks);
+    const invalid=relevant.find(s=>s.scoreIssue && !/미연결|원천 없음|MASTER에 없는/.test(s.scoreIssue));
+    const count=relevant.filter(s=>s.score).length;
+    if(error)setScoreStatus('자동 미연결',scoreFailure(error)+(count?' · 기존 또는 수동 연결 유지':''));
+    else if(invalid)setScoreStatus(/해시/.test(invalid.scoreIssue)?'해시 불일치':'검증 불일치',`${invalid.scoreIssue} · 해당 값은 미수집`);
+    else setScoreStatus(count?(relevant.some(s=>s.score?.__mode==='auto')?'자동 연결 성공':'수동 연결 · 자동 미연결'):'미연결',count?`MASTER에 포함된 ${count}건 연결 · 조회에서 보이지 않는 파일은 수동 선택이 필요할 수 있습니다.`:'허용된 조회 결과에 해당 코호트 점수 없음 · 보조 데이터에서 수동 선택해 주세요.');
+  }
+  function renderScoreConnection(){
+    if(!$('scoreConnectionStatus'))return;
+    $('scoreConnectionStatus').textContent=`점수 ${scoreSession.status}`;
+    $('scoreConnectionMessage').textContent=scoreSession.message;
+    const connected=(state.model?.cohorts||[]).filter(c=>c.stocks.some(s=>s.score));
+    $('scoreConnectedCohorts').textContent=connected.length?connected.map(c=>`${c.date} / ${c.cohortId} (${c.stocks.filter(s=>s.score).length}/${c.stocks.length}건) · ${[...new Set(c.stocks.filter(s=>s.score).map(s=>s.score.__source))].join(', ')}`).join(' · '):'연결 코호트 없음';
+    $('scoreConnectionChecked').textContent='마지막 연결 확인: '+(scoreSession.checkedAt?new Date(scoreSession.checkedAt).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' KST':'—');
+    $('retryScoresBtn').disabled=!state.token || state.mode!=='drive' || scoreSession.status==='확인 중';
+  }
+
+  function assemble(render=true){
     const p=state.files.masterPointer,g=state.files.generation;
-    if(!p||!g){state.model=null;renderAll();return}
+    if(!p||!g){state.model=null;if(render)renderAll();return}
     if(p.validation_status!=='PASS'||g.validation_status!=='PASS')throw Error('검증 PASS가 아닌 MASTER는 사용할 수 없습니다.');
     if(g.sha256!==p.generation)throw Error('MASTER 포인터와 generation 해시 식별자가 불일치합니다.');
     if(state.fileIds.generation && p.location!==state.fileIds.generation)throw Error('generation과 포인터가 다릅니다. 최신 MASTER 포인터를 다시 선택해 주세요.');
@@ -306,7 +416,7 @@
     const locked=[...registered];
     if(ext){const i=locked.findIndex(x=>x.selection_date===ext.selection_date);if(i>=0)locked[i]=ext;else locked.push(ext)}
     locked.sort((a,b)=>String(a.selection_date).localeCompare(String(b.selection_date)));
-    const scores=scoreIndex(state.files.scoreSnapshot);
+    const scores=scoreIndex(scoreDocuments(),registered);
     const masterByKey=new Map(db.map(r=>[r.__date+'|'+r.__code,r]));
     const cohorts=locked.map(c=>({date:c.selection_date,cohortId:c.cohort_id,stocks:(c.stocks||[]).map(s=>{
       const record=masterByKey.get(c.selection_date+'|'+code(s.stock_code));
@@ -317,10 +427,10 @@
     })}));
     const latest=cohorts.at(-1);
     state.model={pointer:p,generation:g,master,board,momentum,top5reason,db,official,legacy,cohorts,scores,masterByKey};
-    $('workflowSection').classList.add('compact');$('toggleConnection').textContent='연결 관리 펼치기';$('settingsPanel').hidden=true;
+    if(render){$('workflowSection').classList.add('compact');$('toggleConnection').textContent='연결 관리 펼치기';$('settingsPanel').hidden=true;}
     if(!state.selectedCohort || !cohorts.some(c=>c.date===state.selectedCohort))state.selectedCohort=latest?.date||'';
     if(!findStock(state.selectedKey))state.selectedKey='';
-    renderAll();
+    if(render)renderAll();
   }
   function currentCohort(){return state.model?.cohorts.find(x=>x.date===state.selectedCohort)||state.model?.cohorts.at(-1)||null}
   function currentStocks(){return currentCohort()?.stocks||[]}
@@ -331,25 +441,45 @@
   // No official composite score is present in the investigated sources.
   const SCORE_FIELDS=Object.freeze({total:null,chart:'chart_technical_score_100',momentum:'momentum_score_100',light:'light_rank_score'});
   function scoreKey(date,cohort,id){return `${date}|${cohort}|${code(id)}`}
-  function scoreIndex(file){
+  function scoreIndex(documents,cohorts=[]){
     const index=new Map();
-    for(const snapshot of file?.snapshots||[]){
-      if(!/^\d{4}-\d{2}-\d{2}$/.test(snapshot.selection_date||'') || !snapshot.cohort_id)continue;
-      for(const row of snapshot.records||[]){
-        if(!/^\d{6}$/.test(code(row.stock_code)))continue;
-        const key=scoreKey(snapshot.selection_date,snapshot.cohort_id,row.stock_code);
-        let issue='';
+    const allowed=new Map(cohorts.map(c=>[c.selection_date+'|'+c.cohort_id,c]));
+    for(const document of documents){
+      const file=document.data;
+      const definitionsOK=Object.entries(SCORE_DEFINITIONS).every(([key,value])=>file.score_definitions?.[key]===value);
+      for(const snapshot of file.snapshots||[]){
+        if(!snapshot || typeof snapshot!=='object')continue;
+        const cohort=allowed.get(snapshot.selection_date+'|'+snapshot.cohort_id);if(!cohort)continue;
+        let issue=definitionsOK?'':'점수 필드 정의 불일치';
+        const records=Array.isArray(snapshot.records)?snapshot.records:[];
+        const expected=new Set(cohort.stocks.map(s=>code(s.stock_code)));
+        if(records.length!==expected.size || (snapshot.record_count!==undefined && snapshot.record_count!==records.length))issue='점수 코호트 부분 업로드 또는 건수 불일치';
         if(snapshot.source_hash_reference_matches===false)issue='스냅샷 원천 해시 확인 실패';
-        if((row.selection_date && row.selection_date!==snapshot.selection_date) || (row.cohort_id && row.cohort_id!==snapshot.cohort_id))issue='스냅샷 내부 선정일·코호트 불일치';
-        const entry={...row,selection_date:snapshot.selection_date,cohort_id:snapshot.cohort_id,__issue:issue};
-        index.set(key,index.has(key)?{__issue:'동일 코호트·종목 점수 중복'}:entry);
+        const codes=new Set();
+        for(const row of records){
+          const raw=row?.stock_code;
+          if(!((typeof raw==='string' && /^\d{1,6}$/.test(raw)) || (Number.isInteger(raw) && raw>=0 && raw<=999999)) || !expected.has(code(raw)))issue='점수 종목코드 불일치';
+          if(codes.has(code(raw)))issue='동일 코호트·종목 점수 중복';codes.add(code(raw));
+          if((row?.selection_date && row.selection_date!==snapshot.selection_date) || (row?.cohort_id && row.cohort_id!==snapshot.cohort_id))issue='스냅샷 내부 선정일·코호트 불일치';
+        }
+        for(const stock of cohort.stocks){
+          const key=scoreKey(snapshot.selection_date,snapshot.cohort_id,stock.stock_code);
+          const row=records.find(r=>code(r?.stock_code)===code(stock.stock_code));
+          const entry={...row,selection_date:snapshot.selection_date,cohort_id:snapshot.cohort_id,__issue:issue,__source:document.name,__mode:document.mode||'manual'};
+          if(index.has(key)){
+            const previous=index.get(key);
+            index.set(key,{__issue:previous.source_pack_declared_sha256!==entry.source_pack_declared_sha256?'스냅샷 간 원천 참조 해시 충돌':'이전 스냅샷과 코호트·종목 중복'});
+          }else index.set(key,entry);
+        }
       }
     }
     return index;
   }
   function scoreMismatch(row,cohort,stock){
-    if(!row)return state.files.scoreSnapshot?'해당 선정일·코호트·종목의 점수 원천 없음':'선정 점수 스냅샷 미연결';
+    if(!row)return (state.files.scoreSnapshot || scoreSession.documents.length)?'해당 선정일·코호트·종목의 점수 원천 없음':'선정 점수 스냅샷 미연결';
     if(row.__issue)return row.__issue;
+    if(!row.scores || typeof row.scores!=='object')return '점수 필드 미수집';
+    if(!/^[a-f0-9]{64}$/i.test(cohort.MORNING_PACK_SHA256||''))return '공식 LOCK의 점수 참조 해시 미수집';
     if(cohort.MORNING_PACK_SHA256 && row.source_pack_declared_sha256!==cohort.MORNING_PACK_SHA256)return '공식 LOCK의 참조팩 해시와 점수 원천 불일치';
     if(row.scoring_model && cohort.model_version && row.scoring_model!==cohort.model_version)return '선정 점수 모델 불일치';
     if(row.selection_rank!==undefined && Number(row.selection_rank)!==Number(stock.rank||stock['Selection Rank']))return '공식 선정 순위와 점수 레코드 불일치';
@@ -424,9 +554,9 @@
     });
     $('content').innerHTML=`<p class="muted">공식 코호트별 검증 현황. D+5 미종료의 TRACKING을 실패에 포함하지 않음. 새 기준과 LEGACY_REFERENCE 통계는 합산하지 않음.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px"><b>LEGACY_REFERENCE (별도 참고 통계)</b><p>기록 ${m.legacy.length}종 · 새 기준 헌터 성공률에 미포함</p><b>공식 NEW_20261008</b><p>기록 ${m.official.length}종 · MASTER ${h(m.pointer.as_of)} 기준</p></div>`;
   }
-  function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null);const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'미수집';
+  function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>k?sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null):[];const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'미수집';
     const kinds=[['공식 종합점수',null],['LIGHT 순위 참고점수','light_rank_score'],['차트·기술 점수','chart_technical_score_100'],['모멘텀 점수','momentum_score_100'],['거래량 점수','volume_score_100'],['캔들 점수','candle_score_100'],['종가 위치','close_position_score_100'],['돌파 위치','breakout_position_score_100'],['세션 강도','session_strength_score_100']];
-    $('content').innerHTML=`<p class="muted">선정 시점 점수만 표시합니다. 점수 스냅샷을 선택하지 않았거나 원자료에 없는 항목은 0으로 채우지 않습니다.</p><div class="learning-grid">${kinds.map(([label,key])=>`<article class="learning-card"><h3>${h(label)}</h3><strong>${h(avg(vals(key)))}</strong><p>데이터 ${vals(key).length}/${currentStocks().length}종 · 선정 당시 원자료 기준</p></article>`).join('')}</div><div class="reason-card" style="cursor:default;margin-top:15px"><b>원천에 없는 점수 항목</b><p>독립 추세 · 패턴 · 타이밍 · 수급 · 뉴스 점수는 원자료에 없다면 미측정으로 표시. 기존 점수 산식·가중치를 임의 변경하지 않음.</p></div>`;
+    $('content').innerHTML=`<p class="muted">선정 시점 점수만 표시합니다. 점수 스냅샷을 선택하지 않았거나 원자료에 없는 항목은 0으로 채우지 않습니다.</p><div class="learning-grid">${kinds.map(([label,key])=>`<article class="learning-card"><h3>${h(label)}</h3><strong>${h(avg(vals(key)))}</strong><p>데이터 ${vals(key).length}/${currentStocks().length}종 · 선정 당시 원자료 기준</p></article>`).join('')}</div><div class="reason-card" style="cursor:default;margin-top:15px"><b>원천에 없는 점수 항목</b><p>독립 추세 · 패턴 · 타이밍 · 수급 · 뉴스 점수는 원자료에 없다면 미수집으로 표시. 기존 점수 산식·가중치를 임의 변경하지 않음.</p></div>`;
   }
   function renderDetail(){const s=chosen();if(!s){$('detail').innerHTML='<h2>종목 상세</h2><p class="muted">검증된 MASTER 데이터와 공식 30종이 연결되면 차트·선정 이유를 표시합니다.</p>';return}
     const r=s.record;const prices=[];for(let i=1;i<=5;i++){const close=num(r?.[`D+${i} Close`]);const day=r?.[`D+${i} Date`];if(close!==null && day)prices.push({v:close,day})}
@@ -441,6 +571,7 @@
     return `<svg viewBox="0 0 310 165" role="img" aria-label="검증 일별 종가 추세"><line x1="25" y1="30" x2="290" y2="30" stroke="#263b55"/><line x1="25" y1="84" x2="290" y2="84" stroke="#263b55"/><line x1="25" y1="137" x2="290" y2="137" stroke="#263b55"/><polyline points="${poly}" fill="none" stroke="#4897ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${xy.map(p=>`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#6cb4ff"/>`).join('')}<text x="20" y="17" fill="#8db2d7" font-size="10">${h(comma(hi))}</text><text x="20" y="155" fill="#8db2d7" font-size="10">${h(comma(lo))}</text></svg>`;
   }
   function renderAll(){
+    renderScoreConnection();
     $('dashboardBody').hidden=!state.model;
     document.querySelectorAll('#tabs [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab));
     summary();renderContent();renderDetail();
