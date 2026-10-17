@@ -306,14 +306,14 @@
     const locked=[...registered];
     if(ext){const i=locked.findIndex(x=>x.selection_date===ext.selection_date);if(i>=0)locked[i]=ext;else locked.push(ext)}
     locked.sort((a,b)=>String(a.selection_date).localeCompare(String(b.selection_date)));
-    let snapshots=[];
-    if(state.files.scoreSnapshot){snapshots=state.files.scoreSnapshot.snapshots.flatMap(s=>(s.records||[]).map(r=>({...r,__date:s.selection_date})));}
-    const scores=new Map(snapshots.map(r=>[String(r.selection_date)+'|'+code(r.stock_code),r]));
+    const scores=scoreIndex(state.files.scoreSnapshot);
     const masterByKey=new Map(db.map(r=>[r.__date+'|'+r.__code,r]));
     const cohorts=locked.map(c=>({date:c.selection_date,cohortId:c.cohort_id,stocks:(c.stocks||[]).map(s=>{
       const record=masterByKey.get(c.selection_date+'|'+code(s.stock_code));
-      const score=scores.get(c.selection_date+'|'+code(s.stock_code));
-      return {date:c.selection_date,cohortId:c.cohort_id,rank:Number(s.rank||s['Selection Rank']||0),code:code(s.stock_code),name:s.stock_name||'이름 없음',top5:!!s.top5,reason:s.Selection_Reason||'',record,score};
+      const candidate=scores.get(scoreKey(c.selection_date,c.cohort_id,s.stock_code));
+      const scoreIssue=scoreMismatch(candidate,c,s);
+      const score=scoreIssue?null:candidate;
+      return {date:c.selection_date,cohortId:c.cohort_id,rank:Number(s.rank||s['Selection Rank']||0),code:code(s.stock_code),name:s.stock_name||'이름 없음',top5:!!s.top5,reason:s.Selection_Reason||'',record,score,scoreIssue};
     })}));
     const latest=cohorts.at(-1);
     state.model={pointer:p,generation:g,master,board,momentum,top5reason,db,official,legacy,cohorts,scores,masterByKey};
@@ -327,21 +327,56 @@
   function findStock(key){if(!key)return null;return currentStocks().find(x=>x.date+'|'+x.code===key)||null}
   function chosen(){return findStock(state.selectedKey)||currentStocks()[0]||null}
   function resultType(r){const s=String(r?.['Final Result']||'PENDING').toUpperCase();return ['SUCCESS','FAIL','TRACKING','PENDING'].includes(s)?s:'PENDING'}
-  function knownScore(s,n){return s?.scores && num(s.scores[n])!==null?num(s.scores[n]):null}
+  // Only fields whose meaning was verified in the selection-time score snapshot.
+  // No official composite score is present in the investigated sources.
+  const SCORE_FIELDS=Object.freeze({total:null,chart:'chart_technical_score_100',momentum:'momentum_score_100',light:'light_rank_score'});
+  function scoreKey(date,cohort,id){return `${date}|${cohort}|${code(id)}`}
+  function scoreIndex(file){
+    const index=new Map();
+    for(const snapshot of file?.snapshots||[]){
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(snapshot.selection_date||'') || !snapshot.cohort_id)continue;
+      for(const row of snapshot.records||[]){
+        if(!/^\d{6}$/.test(code(row.stock_code)))continue;
+        const key=scoreKey(snapshot.selection_date,snapshot.cohort_id,row.stock_code);
+        let issue='';
+        if(snapshot.source_hash_reference_matches===false)issue='스냅샷 원천 해시 확인 실패';
+        if((row.selection_date && row.selection_date!==snapshot.selection_date) || (row.cohort_id && row.cohort_id!==snapshot.cohort_id))issue='스냅샷 내부 선정일·코호트 불일치';
+        const entry={...row,selection_date:snapshot.selection_date,cohort_id:snapshot.cohort_id,__issue:issue};
+        index.set(key,index.has(key)?{__issue:'동일 코호트·종목 점수 중복'}:entry);
+      }
+    }
+    return index;
+  }
+  function scoreMismatch(row,cohort,stock){
+    if(!row)return state.files.scoreSnapshot?'해당 선정일·코호트·종목의 점수 원천 없음':'선정 점수 스냅샷 미연결';
+    if(row.__issue)return row.__issue;
+    if(cohort.MORNING_PACK_SHA256 && row.source_pack_declared_sha256!==cohort.MORNING_PACK_SHA256)return '공식 LOCK의 참조팩 해시와 점수 원천 불일치';
+    if(row.scoring_model && cohort.model_version && row.scoring_model!==cohort.model_version)return '선정 점수 모델 불일치';
+    if(row.selection_rank!==undefined && Number(row.selection_rank)!==Number(stock.rank||stock['Selection Rank']))return '공식 선정 순위와 점수 레코드 불일치';
+    if(row.selection_reason_as_locked!==undefined && row.selection_reason_as_locked!==(stock.Selection_Reason||''))return '공식 선정 이유와 점수 레코드 불일치';
+    return '';
+  }
+  function knownScore(s,n){
+    const value=s?.scores?.[n];
+    if(!['number','string'].includes(typeof value) || (typeof value==='string' && !value.trim()))return null;
+    const score=num(value);return score!==null && score>=0 && score<=100?score:null;
+  }
+  function scoreValue(s,kind){return SCORE_FIELDS[kind]?knownScore(s.score,SCORE_FIELDS[kind]):null}
+  function scoreText(s,kind){const value=scoreValue(s,kind);return value===null?'미수집':fixed(value,2)}
+  function scoreNote(s){return s.scoreIssue || `선정 점수 스냅샷 · ${s.cohortId} · 점수 기준 ${fmtDay(s.score?.score_data_as_of)}`}
   function finalRate(rows){const complete=rows.filter(r=>['SUCCESS','FAIL'].includes(resultType(r)) && String(r.Status||'').toUpperCase()==='CLOSED');const win=complete.filter(r=>resultType(r)==='SUCCESS').length;return {total:complete.length,win,rate:complete.length?100*win/complete.length:null}}
   function summary(){
     const m=state.model;
     const stat=(title,value,desc,icon,vals)=>`<article class="card kpi"><div class="kpi-name"><em>${icon}</em>${h(title)}</div><div class="kpi-value">${h(value)}</div><div class="kpi-sub">${h(desc)}</div>${vals?.length?'<div class="kpi-graph">'+vals.map(v=>`<i data-bar="${Math.max(5,Math.min(100,Number(v)||0))}"></i>`).join('')+'</div>':''}</article>`;
-    if(!m){$('summary').innerHTML=[stat('Hunter 확정 성공률','—','공식 검증 MASTER 필요','◎'),stat('종합점수','—','선정시점 점수 스냅샷 필요','♜'),stat('DAY별 성공현황','—','검증된 코호트 기록 없음','▥'),stat('ACTIVE 코호트','—','Drive 연결 대기','♧'),stat('TOP5 평균 MFE','—','관측값 없음','↗'),stat('TOP5 평균 MAE','—','관측값 없음','↘'),stat('운영 체크포인트','08:30','15:40 · 16:20 / 주문 0건','▤')].join('');setBars();return}
+    if(!m){$('summary').innerHTML=[stat('Hunter 확정 성공률','—','공식 검증 MASTER 필요','◎'),stat('종합점수','미수집','공식 종합점수 원천 필드 없음','♜'),stat('DAY별 성공현황','—','검증된 코호트 기록 없음','▥'),stat('ACTIVE 코호트','—','Drive 연결 대기','♧'),stat('TOP5 평균 MFE','—','관측값 없음','↗'),stat('TOP5 평균 MAE','—','관측값 없음','↘'),stat('운영 체크포인트','08:30','15:40 · 16:20 / 주문 0건','▤')].join('');setBars();return}
     const r=finalRate(m.official);const dayCounts=m.cohorts.map(c=>c.stocks.filter(s=>s.record && resultType(s.record)==='SUCCESS').length);
     const activeDates=new Set(m.official.filter(x=>x.Status==='ACTIVE').map(r=>r.__date));
-    const sc=currentStocks().map(x=>knownScore(x.score,'light_rank_score')).filter(x=>x!==null);
     const top=m.official.filter(r=>String(r.TOP5)==='True'||r.TOP5===true||String(r.TOP5)==='1');
     const mfe=top.map(x=>num(x['MFE %'])).filter(x=>x!==null);const mae=top.map(x=>num(x['MAE %'])).filter(x=>x!==null);
     const avg=arr=>arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:null;
     $('summary').innerHTML=[
       stat('Hunter 확정 성공률',r.rate===null?'미확정':r.rate.toFixed(1)+'%',`새 기준 종료 ${r.total}종 · 성공 ${r.win}종`,'◎'),
-      stat('종합점수',sc.length?avg(sc).toFixed(1)+'/100':'—',sc.length?`LIGHT 점수 ${sc.length}종 · 차트점수와 별개`:'점수 스냅샷 선택 필요','♜'),
+      stat('종합점수','미수집','공식 종합점수 원천 필드 없음 · LIGHT와 구분','♜'),
       stat('DAY별 성공현황',`${m.cohorts.length} DAY`,`실제 관측 성공 ${m.official.filter(x=>resultType(x)==='SUCCESS').length}종 · 확정과 구분`,'▥',dayCounts.map(x=>x/30*100)),
       stat('ACTIVE 코호트',String(activeDates.size),`공식 새 기준 ${m.official.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
       stat('TOP5 평균 MFE',avg(mfe)===null?'—':pct(avg(mfe)),`새 기준 관측 종목 ${mfe.length}개 · 최종수익률 아님`,'↗'),
@@ -360,8 +395,8 @@
     const q=state.search;
     return !q || `${s.name} ${s.code} ${s.reason}`.toLowerCase().includes(q);
   });
-    const n=s=>state.sort==='mfe'?num(valueOf(s,'MFE %')):state.sort==='chart'?knownScore(s.score,'chart_technical_score_100'):state.sort==='momentum'?knownScore(s.score,'momentum_score_100'):state.sort==='total'?knownScore(s.score,'light_rank_score'):null;
-    if(state.sort==='rank')arr=arr.sort((a,b)=>a.rank-b.rank);else arr=arr.sort((a,b)=>(n(b)??-1e9)-(n(a)??-1e9));
+    const n=s=>state.sort==='mfe'?num(valueOf(s,'MFE %')):scoreValue(s,state.sort);
+    if(state.sort==='rank')arr=arr.sort((a,b)=>a.rank-b.rank);else arr=arr.sort((a,b)=>(n(b)??-1e9)-(n(a)??-1e9)||a.rank-b.rank);
     return arr;
   }
   function renderFilters(){const ss=currentStocks();const items=[['all',`전체 (${ss.length})`],['top5',`TOP5 (${ss.filter(s=>s.top5).length})`],['success',`관측 SUCCESS (${ss.filter(s=>resultType(s.record)==='SUCCESS').length})`],['pending',`MASTER 미반영 (${ss.filter(s=>!s.record).length})`]];
@@ -376,8 +411,8 @@
     if(state.tab==='days')return renderDays();
     if(state.tab==='learning')return renderLearning();
   }
-  function renderStocks(){const list=shownStocks();$('content').innerHTML=`<div class="data-wrap"><table class="stock-table"><thead><tr><th>순위</th><th>종목명 · 코드</th><th>검증 종가</th><th>+3% 목표</th><th>Hunter</th><th>차트점수</th><th>모멘텀</th><th>LIGHT 점수</th><th>MFE</th><th>MAE</th><th>코호트</th></tr></thead><tbody>${list.map(s=>{
-    const r=s.record;const re=r?resultType(r):'WAIT';const chart=knownScore(s.score,'chart_technical_score_100');const mom=knownScore(s.score,'momentum_score_100');const total=knownScore(s.score,'light_rank_score');return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${statusBadge(re)}</td><td class="score">${h(chart===null?'—':fixed(chart))}</td><td class="score">${h(mom===null?'—':fixed(mom))}</td><td>${h(total===null?'—':fixed(total))}</td><td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="11" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div>`;
+  function renderStocks(){const list=shownStocks();$('content').innerHTML=`<div class="data-wrap"><table class="stock-table"><thead><tr><th>순위</th><th>종목명 · 코드</th><th>검증 종가</th><th>+3% 목표</th><th>Hunter</th><th>종합점수</th><th>차트·기술</th><th>모멘텀</th><th>LIGHT 점수</th><th>MFE</th><th>MAE</th><th>코호트</th></tr></thead><tbody>${list.map(s=>{
+    const r=s.record;const re=r?resultType(r):'WAIT';return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${statusBadge(re)}</td>${['total','chart','momentum','light'].map(kind=>`<td class="score" title="${h(kind==='total'?'공식 종합점수 원천 필드 없음':scoreNote(s))}">${h(scoreText(s,kind))}</td>`).join('')}<td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="12" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div><p class="muted">점수는 별도 LEARNING_SCORE_SNAPSHOT JSON을 보조 데이터에서 선택하면 연결됩니다. 선정일·코호트·종목코드와 LOCK 참조팩이 일치하는 값만 표시합니다. 종합점수는 미수집이며 LIGHT는 순위 참고점수입니다.</p>`;
     document.querySelectorAll('tr[data-select]').forEach(row=>row.addEventListener('keydown',e=>{if(e.key==='Enter'){state.selectedKey=row.dataset.select;renderAll()}}));
   }
   function renderReasons(){const list=shownStocks();$('content').innerHTML=`<p class="muted">공식 LOCK의 선정 당시 원문을 표시합니다. 후일의 주가·뉴스를 선정 이유에 소급 반영하지 않습니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${s.rank}. ${h(s.name)} ${s.top5?'<span class="status track">TOP5</span>':''}</b><p>${h(s.reason||'공식 선정 이유 기록 없음')}</p></button>`).join('')||'<div class="empty">선정 이유 자료가 없습니다.</div>'}`}
@@ -389,15 +424,15 @@
     });
     $('content').innerHTML=`<p class="muted">공식 코호트별 검증 현황. D+5 미종료의 TRACKING을 실패에 포함하지 않음. 새 기준과 LEGACY_REFERENCE 통계는 합산하지 않음.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px"><b>LEGACY_REFERENCE (별도 참고 통계)</b><p>기록 ${m.legacy.length}종 · 새 기준 헌터 성공률에 미포함</p><b>공식 NEW_20261008</b><p>기록 ${m.official.length}종 · MASTER ${h(m.pointer.as_of)} 기준</p></div>`;
   }
-  function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null);const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'—';
-    const kinds=[['차트·기술 점수','chart_technical_score_100'],['모멘텀 점수','momentum_score_100'],['거래량 점수','volume_score_100'],['캔들 점수','candle_score_100'],['종가 위치','close_position_score_100'],['돌파 위치','breakout_position_score_100'],['세션 강도','session_strength_score_100']];
+  function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null);const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'미수집';
+    const kinds=[['공식 종합점수',null],['LIGHT 순위 참고점수','light_rank_score'],['차트·기술 점수','chart_technical_score_100'],['모멘텀 점수','momentum_score_100'],['거래량 점수','volume_score_100'],['캔들 점수','candle_score_100'],['종가 위치','close_position_score_100'],['돌파 위치','breakout_position_score_100'],['세션 강도','session_strength_score_100']];
     $('content').innerHTML=`<p class="muted">선정 시점 점수만 표시합니다. 점수 스냅샷을 선택하지 않았거나 원자료에 없는 항목은 0으로 채우지 않습니다.</p><div class="learning-grid">${kinds.map(([label,key])=>`<article class="learning-card"><h3>${h(label)}</h3><strong>${h(avg(vals(key)))}</strong><p>데이터 ${vals(key).length}/${currentStocks().length}종 · 선정 당시 원자료 기준</p></article>`).join('')}</div><div class="reason-card" style="cursor:default;margin-top:15px"><b>원천에 없는 점수 항목</b><p>독립 추세 · 패턴 · 타이밍 · 수급 · 뉴스 점수는 원자료에 없다면 미측정으로 표시. 기존 점수 산식·가중치를 임의 변경하지 않음.</p></div>`;
   }
   function renderDetail(){const s=chosen();if(!s){$('detail').innerHTML='<h2>종목 상세</h2><p class="muted">검증된 MASTER 데이터와 공식 30종이 연결되면 차트·선정 이유를 표시합니다.</p>';return}
     const r=s.record;const prices=[];for(let i=1;i<=5;i++){const close=num(r?.[`D+${i} Close`]);const day=r?.[`D+${i} Date`];if(close!==null && day)prices.push({v:close,day})}
     const chart=prices.length?lineChart(prices):'<div class="empty" style="padding:35px 4px">검증된 D+1~D+5 일별 종가 없음<br>키움 WebSocket 실시간 차트는 이후 단계</div>';
     const reasons=String(s.reason||'선정 이유 미기록').split(/;\s*/).filter(Boolean);
-    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} 공식 LOCK ${s.top5?'· TOP5':''}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${prices.length?'MASTER D+1~D+5 검증 종가만 연결됨':'미관측 / 미검증 데이터는 표시하지 않음'}</div></div><div class="detail-h">3% Hunter 관측</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'MASTER 성과 미반영'}</li><li>기준 D+1 시초가: <strong>${h(money(r?.['Reference Open']))}</strong>　목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달일: <strong>${h(r?.['First Hit D+']||'—')}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')||'<li>선정 이유 미기록</li>'}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>차트: <strong>${h(fixed(knownScore(s.score,'chart_technical_score_100')))}</strong> / 모멘텀: <strong>${h(fixed(knownScore(s.score,'momentum_score_100')))}</strong></li><li>LIGHT: <strong>${h(fixed(knownScore(s.score,'light_rank_score')))}</strong> · 원자료 없는 점수는 미측정</li></div>`;
+    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} 공식 LOCK ${s.top5?'· TOP5':''}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${prices.length?'MASTER D+1~D+5 검증 종가만 연결됨':'미관측 / 미검증 데이터는 표시하지 않음'}</div></div><div class="detail-h">3% Hunter 관측</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'MASTER 성과 미반영'}</li><li>기준 D+1 시초가: <strong>${h(money(r?.['Reference Open']))}</strong>　목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달일: <strong>${h(r?.['First Hit D+']||'—')}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')||'<li>선정 이유 미기록</li>'}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>종합점수: <strong>${h(scoreText(s,'total'))}</strong> · 공식 종합점수 원천 필드 없음</li><li>차트·기술: <strong>${h(scoreText(s,'chart'))}</strong> / 모멘텀: <strong>${h(scoreText(s,'momentum'))}</strong></li><li>LIGHT 순위 참고점수: <strong>${h(scoreText(s,'light'))}</strong></li><li>${h(scoreNote(s))}</li><li>원자료 없는 점수는 미수집 · 선정 이유의 점수 표현은 LOCK 원문 그대로 보존</li></div>`;
   }
   function lineChart(prices){
     const values=prices.map(p=>p.v);const lo=Math.min(...values),hi=Math.max(...values),span=Math.max(1,hi-lo);
@@ -414,3 +449,4 @@
   }
   document.addEventListener('DOMContentLoaded',bootstrap);
 })();
+

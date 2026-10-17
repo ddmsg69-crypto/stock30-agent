@@ -41,7 +41,7 @@
       <div class="step"><span class="step-number">1</span><div><b>Google 인증</b><small>본인 Drive 권한</small></div><span class="step-state" id="loginState">대기</span></div>
       <div class="step"><span class="step-number">2</span><div><b>MASTER 포인터</b><small>master_current.json</small></div><button class="thin-btn" type="button" id="pickPointerBtn" disabled>Drive에서 선택</button></div>
       <div class="step"><span class="step-number">3</span><div><b>검증 생성본</b><small>master21_generation_*.json</small></div><button class="thin-btn" type="button" id="pickGenerationBtn" disabled>Drive에서 선택</button></div>
-      <div class="step"><span class="step-number">4</span><div><b>보조 데이터</b><small>공식 LOCK / 차트·모멘텀 점수 JSON</small></div><button class="thin-btn" type="button" id="pickExtraBtn" disabled>선택 (선택사항)</button></div>
+      <div class="step"><span class="step-number">4</span><div><b>보조 데이터</b><small>공식 LOCK / LEARNING_SCORE_SNAPSHOT JSON</small></div><button class="thin-btn" type="button" id="pickExtraBtn" disabled>선택 (선택사항)</button></div>
     </div>
     <div class="workflow-bottom"><div id="dataStatus" aria-live="polite">Google 로그인부터 시작하세요. 최초 1회 Drive 파일 권한을 승인하면 다음 접속 시 자동 불러오기를 시도합니다.</div><button type="button" class="thin-btn" id="refreshMasterBtn">↻ 최신 MASTER 확인</button><label class="upload-label">로컬 파일로 미리 확인<input id="localImport" type="file" accept=".json,application/json" multiple></label><button type="button" class="quiet-btn" id="clearBtn">현재 화면 지우기</button><button type="button" class="quiet-btn" id="forgetFilesBtn">기억한 연결 지우기</button></div>
   </section>
@@ -52,7 +52,7 @@
       <nav class="tabs" id="tabs" aria-label="대시보드 탭">
         <button type="button" class="active" data-tab="stocks">MASTER 선정 30종</button><button type="button" data-tab="reasons">선정 이유</button><button type="button" data-tab="top5">TOP5</button><button type="button" data-tab="days">DAY별 성과</button><button type="button" data-tab="learning">학습 데이터</button>
       </nav>
-      <div class="controls"><div class="filters" id="filters"></div><div class="right-tools"><input id="search" type="search" placeholder="종목명·코드 검색" aria-label="종목 검색"><select id="sort" aria-label="정렬"><option value="rank">선정 순위</option><option value="total">종합점수순</option><option value="chart">차트점수순</option><option value="momentum">모멘텀순</option><option value="mfe">MFE순</option></select></div></div>
+      <div class="controls"><div class="filters" id="filters"></div><div class="right-tools"><input id="search" type="search" placeholder="종목명·코드 검색" aria-label="종목 검색"><select id="sort" aria-label="정렬"><option value="rank">선정 순위</option><option value="total" disabled>종합점수순 (미수집)</option><option value="chart">차트점수순</option><option value="momentum">모멘텀순</option><option value="light">LIGHT 점수순</option><option value="mfe">MFE순</option></select></div></div>
       <div id="content" class="tab-content"></div>
     </section>
     <aside id="detail" class="card detail" aria-label="선택 종목 상세"></aside>
@@ -62,3 +62,4 @@
 <footer class="bottom"><span class="green-dot"></span><span id="footerState">실제 MASTER 파일 연결 전</span><span class="divider">│</span><span>공식 선정은 D0 · Hunter 판정은 D+1~D+5</span><span class="divider">│</span><span>주문 기능 없음</span><span class="divider">│</span><a href="./privacy.html">개인정보처리방침</a></footer>
 </body>
 </html>
+
