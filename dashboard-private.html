@@ -48,11 +48,16 @@
   <div class="dashboard-body" id="dashboardBody" hidden>
   <section class="card" aria-label="점수 스냅샷 연결 상태" style="padding:16px;margin-bottom:16px">
     <strong id="scoreConnectionStatus" role="status" aria-live="polite">점수 미연결</strong>
+    <p id="scoreModeLabel" class="muted">연결 방식: 기존 스냅샷</p>
     <p id="scoreConnectionMessage" class="muted">MASTER 연결 후 허용된 점수 스냅샷을 확인합니다.</p>
+    <p id="scoreConnectionDiagnostic" class="muted" style="overflow-wrap:anywhere" aria-label="익명화된 요청 진단"></p>
     <p id="scoreConnectedCohorts" class="muted" style="overflow-wrap:anywhere">연결 코호트 없음</p>
     <small id="scoreConnectionChecked" class="muted">마지막 연결 확인: —</small>
     <button type="button" class="thin-btn" id="retryScoresBtn">↻ 점수 자동 연결 재시도</button>
-    <p class="muted">08_INTERNAL_ANALYSIS의 접근이 허용된 파일만 조회합니다. 누락되거나 권한이 부족하면 연결 관리의 보조 데이터에서 점수 JSON을 직접 선택해 주세요.</p>
+    <button type="button" class="thin-btn" id="pickFixedScoreBtn" disabled>고정 누적 점수 파일 선택</button>
+    <button type="button" class="quiet-btn" id="useSnapshotModeBtn" disabled>기존 스냅샷 방식 사용</button>
+    <p id="scoreFixedState" class="muted"></p>
+    <p class="muted">고정 누적 파일은 최초 한 번 Picker에서 승인하면 이후 로그인·MASTER 새로고침 때 같은 파일만 확인합니다. 기존 일별 스냅샷은 연결 관리의 보조 데이터에서 계속 선택할 수 있습니다. 파일 접근이 해제되면 다시 로그인하거나 Picker에서 재선택해 주세요.</p>
   </section>
   <div class="kpi-grid" id="summary" aria-label="검증 성과 개요"></div>
   <div class="main-grid">

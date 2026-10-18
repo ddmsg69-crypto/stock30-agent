@@ -15,7 +15,7 @@
   const EMPTY = Object.freeze({masterPointer:null,generation:null,lock:null,scoreSnapshot:null});
   const state = {
     token:'',email:'',config:null,pickerLoaded:false,files:{...EMPTY},fileIds:{},mode:'none',refreshing:false,
-    model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:''
+    model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:'',scoreMode:'snapshot'
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
   // Public web-OAuth client identifier (not a credential). Never embed secrets or access tokens.
@@ -27,7 +27,11 @@
   const SCORE_FOLDER_ID = '13HZpgafKCULsHkKfnhGiohUWbgDzGOXV';
   const SCORE_FILENAME = /^Stock30_LEARNING_SCORE_SNAPSHOT_.*\.json$/;
   const SCORE_DEFINITIONS = Object.freeze({chart_technical_score_100:'score',momentum_score_100:'short_momentum',volume_score_100:'relative_volume',candle_score_100:'candle_strength',close_position_score_100:'close_position',breakout_position_score_100:'breakout_position',session_strength_score_100:'session_strength'});
-  const newScoreSession = () => ({cache:new Map(),documents:[],scanDocuments:null,folderOK:false,inflight:null,lastScan:0,checkedAt:'',status:'미연결',message:'MASTER 연결 후 허용된 점수 스냅샷을 확인합니다.'});
+  const FIXED_SCORE_KIND='STOCK30_WEB_SCORE_CUMULATIVE';
+  const FIXED_SCORE_ROLES=Object.freeze({official_total:null,chart:'chart_technical_score_100',momentum:'momentum_score_100',light:'light_rank_score'});
+  const FIXED_SCORE_LIMIT=12*1024*1024;
+  const newScoreSession = () => ({cache:new Map(),fixedCache:new Map(),fixedAccepted:new Map(),fixedInflight:new Map(),documents:[],scanDocuments:null,diagnostics:[],folderOK:false,inflight:null,lastScan:0,checkedAt:'',status:'미연결',message:'MASTER 연결 후 허용된 점수 스냅샷을 확인합니다.'});
+  const GOOGLE_ERROR_REASONS = new Set(['authError','notFound','appNotAuthorizedToFile','insufficientPermissions','ACCESS_TOKEN_SCOPE_INSUFFICIENT','accessNotConfigured','SERVICE_DISABLED','API_KEY_INVALID','API_KEY_HTTP_REFERRER_BLOCKED','API_KEY_SERVICE_BLOCKED','domainPolicy','rateLimitExceeded','userRateLimitExceeded','dailyLimitExceeded','PERMISSION_DENIED','UNAUTHENTICATED']);
   let scoreSession = newScoreSession();
   let masterRequest = 0;
   let pendingPointer = null;
@@ -75,7 +79,9 @@
     $('logoutBtn').addEventListener('click',signOut);
     $('pickPointerBtn').addEventListener('click',()=>openPicker('masterPointer'));
     $('refreshMasterBtn').addEventListener('click',()=>refreshCurrentMaster(true));
-    $('retryScoresBtn').addEventListener('click',()=>connectScores(true));
+    $('retryScoresBtn').addEventListener('click',()=>connectScores(true).catch(e=>showError('점수 연결',e)));
+    $('pickFixedScoreBtn').addEventListener('click',()=>openPicker('fixedScore'));
+    $('useSnapshotModeBtn').addEventListener('click',()=>useSnapshotMode().catch(e=>showError('점수 연결 방식',e)));
     $('pickGenerationBtn').addEventListener('click',()=>openPicker('generation'));
     $('pickExtraBtn').addEventListener('click',()=>openPicker('extra'));
     $('localImport').addEventListener('change',localImport);
@@ -94,7 +100,7 @@
     const connected=!!state.token && Date.now()<tokenExpiry;
     $('loginBtn').disabled=connected;
     $('logoutBtn').disabled=!connected;
-    ['pickPointerBtn','pickGenerationBtn','pickExtraBtn'].forEach(id=>$(id).disabled=!connected);
+    ['pickPointerBtn','pickGenerationBtn','pickExtraBtn','pickFixedScoreBtn'].forEach(id=>$(id).disabled=!connected);
     $('loginState').textContent=connected?'연결됨':'대기';
     $('authUser').textContent=connected?`Google: ${state.email || '계정 확인 중'}`:state.mode==='local'?'로컬 파일 읽기 모드':'Google 로그인 필요';
     $('welcomePanel').hidden=connected||!!state.model;
@@ -139,10 +145,32 @@
     // Clear local auth state. Google account's app grants are NOT revoked.
     state.token='';state.email='';tokenExpiry=0;clearData();updateConnection();status('브라우저 인증 상태를 종료했습니다. Google 계정 권한 자체는 유지됩니다.');
   }
-  async function authFetch(url){
-    if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();throw Error('인증이 만료됐습니다. Google에 다시 로그인해 주세요.');}
-    const r=await fetch(url,{headers:{Authorization:`Bearer ${state.token}`},cache:'no-store',redirect:'error',signal:typeof AbortSignal!=='undefined'?AbortSignal.timeout(15000):undefined});
-    if(!r.ok){const error=Error(`Google API HTTP ${r.status}${r.status===403?' (권한 또는 API 설정 확인)':''}${r.status===404?' (파일 접근 권한/선택 여부 확인)':''}`);error.status=r.status;throw error;}
+  async function authFetch(url,stage='google_request',maxBytes=0){
+    if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();const error=Error('인증이 만료됐습니다. Google에 다시 로그인해 주세요.');error.status=401;error.stage=stage;error.reasons=['authError'];throw error;}
+    let r;
+    try{r=await fetch(url,{headers:{Authorization:`Bearer ${state.token}`},cache:'no-store',redirect:'error',signal:typeof AbortSignal!=='undefined'?AbortSignal.timeout(15000):undefined});}
+    catch(_){const error=Error('Google 요청 통신 또는 시간 초과');error.stage=stage;error.reasons=['NETWORK_OR_TIMEOUT'];throw error;}
+    if(!r.ok){
+      let body=null;try{body=await r.json()}catch(_){}
+      const reasons=[...(Array.isArray(body?.error?.errors)?body.error.errors.map(e=>e?.reason):[]),...(Array.isArray(body?.error?.details)?body.error.details.map(e=>e?.reason):[])];
+      const error=Error(`Google API HTTP ${r.status}`);error.status=r.status;error.stage=stage;
+      // Never retain or display server messages, metadata, URLs, IDs, response bodies or credentials.
+      error.reasons=[...new Set(reasons.filter(value=>GOOGLE_ERROR_REASONS.has(value)))].slice(0,4);
+      if(!error.reasons.length)error.reasons=['UNKNOWN_REASON'];
+      if(r.status===401){state.token='';tokenExpiry=0;updateConnection();}
+      throw error;
+    }
+    if(maxBytes){
+      if(Number(r.headers.get('content-length'))>maxBytes)throw fixedError('SIZE_LIMIT');
+      const chunks=[];let size=0;
+      if(r.body?.getReader){
+        const reader=r.body.getReader();
+        try{for(;;){const part=await reader.read();if(part.done)break;size+=part.value.byteLength;if(size>maxBytes){await reader.cancel();throw fixedError('SIZE_LIMIT');}chunks.push(part.value);}}
+        catch(e){if(e.fixedCode)throw e;throw fixedError('BODY_INCOMPLETE');}
+      }else{const buffer=new Uint8Array(await r.arrayBuffer());size=buffer.byteLength;if(size>maxBytes)throw fixedError('SIZE_LIMIT');chunks.push(buffer);}
+      const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}
+      try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch(_){throw fixedError('JSON_INVALID');}
+    }
     try{return await r.json()}catch(_){throw Error('Google 파일 JSON 형식 확인 필요');}
   }
   async function loadPicker(){
@@ -164,7 +192,7 @@
       const view=new google.picker.DocsView(google.picker.ViewId.DOCS).setIncludeFolders(true).setSelectFolderEnabled(false).setMode(google.picker.DocsViewMode.LIST);
       const picker=new google.picker.PickerBuilder()
         .addView(view).setOAuthToken(state.token).setDeveloperKey(cfg.apiKey).setAppId(cfg.projectNumber)
-        .setOrigin(window.location.origin).setTitle(kind==='masterPointer'?'master_current.json 선택':kind==='generation'?'master21_generation_*.json 선택':'공식 LOCK 또는 학습 점수 JSON 선택')
+        .setOrigin(window.location.origin).setTitle(kind==='masterPointer'?'master_current.json 선택':kind==='generation'?'master21_generation_*.json 선택':kind==='fixedScore'?'웹 전용 고정 누적 점수 JSON 선택':'공식 LOCK 또는 학습 점수 JSON 선택')
         .setCallback(data=>{
           if(data[google.picker.Response.ACTION]!==google.picker.Action.PICKED)return;
           const list=data[google.picker.Response.DOCUMENTS]||[];
@@ -180,11 +208,18 @@
     const session=scoreSession;
     try{
       status(`${name||'선택한 파일'} 읽는 중...`);
+      if(kind==='fixedScore'){
+        const document=await readFixedScore(id,session);ensureSession(session);
+        const files={...state.files,scoreSnapshot:document.data},ids={...state.fileIds,fixedScore:id};
+        if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';state.scoreMode='fixed';session.documents=[document];rememberFiles();updateConnection();setScoreStatus('MASTER 대기','고정 누적 파일 검증 완료 · MASTER를 연결해 주세요.');return;}
+        await connectScores(false,{files,ids,mode:'drive',scoreMode:'fixed',documents:[document],fixedDocument:document});return;
+      }
       const snapshot=kind==='extra' && SCORE_FILENAME.test(name||'');
       const document=snapshot?await readScoreFile(await scoreMetadata(id),session):null;
       const json=document?.data||await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
       ensureSession(session);
       const inferred=detectType(json);
+      if(json?.kind===FIXED_SCORE_KIND)throw fixedError('USE_FIXED_PICKER');
       if(kind!=='extra' && inferred!==kind)throw Error('선택한 파일 형식을 확인해 주세요.');
       if(kind==='extra' && !['lock','scoreSnapshot'].includes(inferred))throw Error('공식 LOCK 또는 학습 점수 JSON을 선택해 주세요.');
       const type=kind==='extra'?inferred:kind;
@@ -194,17 +229,17 @@
       }
       const files={...state.files,[type]:json},ids={...state.fileIds,[type]:id};
       if(type==='generation' && pendingPointer){files.masterPointer=pendingPointer.data;ids.masterPointer=pendingPointer.id;}
-      const documents=document?session.documents.map(d=>d.id===id?document:d):session.documents;
-      if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';assemble();rememberFiles();updateConnection();status('MASTER 포인터·검증 생성본을 모두 선택해 주세요.');return;}
-      await connectScores(false,{files,ids,mode:'drive',documents});
+      const documents=type==='scoreSnapshot'?(document?[document]:[]):session.documents;
+      if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';if(type==='scoreSnapshot'){state.scoreMode='snapshot';session.documents=documents;}assemble();rememberFiles();updateConnection();status('MASTER 포인터·검증 생성본을 모두 선택해 주세요.');return;}
+      await connectScores(false,{files,ids,mode:'drive',documents,scoreMode:type==='scoreSnapshot'?'snapshot':state.scoreMode});
       if(state.files.generation===json)pendingPointer=null;
       status('파일 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
-    }catch(e){if(session===scoreSession){showError('Drive 파일 조회',e);renderAll();}}
+    }catch(e){if(session===scoreSession){showError('Drive 파일 조회',e);session.checkedAt=new Date().toISOString();setScoreStatus('연결 보류',e.fixedCode?e.message:scoreFailure(e));renderAll();}}
   }
 
   function rememberFiles(){
     if(!state.email||state.mode!=='drive')return;
-    try{localStorage.setItem(FILE_CACHE_KEY,JSON.stringify({email:state.email,ids:{...state.fileIds},savedAt:new Date().toISOString()}))}
+    try{localStorage.setItem(FILE_CACHE_KEY,JSON.stringify({email:state.email,ids:{...state.fileIds},scoreMode:state.scoreMode,savedAt:new Date().toISOString()}))}
     catch(_){status('이 브라우저에서 파일 연결 기억을 저장하지 못했습니다. 다음 방문 시 다시 선택해야 할 수 있습니다.',true)}
   }
   function forgetRemembered(){
@@ -221,14 +256,17 @@
     if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS' || !/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('저장된 MASTER 포인터 확인 필요');
     const generation=await fetchId(pointer.location);ensureSession(session);
     const files={...EMPTY,masterPointer:pointer,generation},ids={masterPointer:cached.ids.masterPointer,generation:pointer.location};
+    const scoreMode=cached.scoreMode==='fixed'?'fixed':'snapshot';
+    if(scoreMode==='fixed' && typeof cached.ids.fixedScore==='string')ids.fixedScore=cached.ids.fixedScore;
     for(const type of ['lock','scoreSnapshot']){
+      if(type==='scoreSnapshot' && scoreMode==='fixed')continue;
       const id=cached.ids[type];if(!id)continue;
       try{
         const extra=type==='scoreSnapshot'?(await readScoreFile(await scoreMetadata(id),session)).data:await fetchId(id);
         ensureSession(session);if(detectType(extra)===type){files[type]=extra;ids[type]=id;}
       }catch(_){ensureSession(session);/* Optional files never prevent a read-only MASTER view. */}
     }
-    await connectScores(false,{files,ids,mode:'drive'});
+    await connectScores(false,{files,ids,mode:'drive',scoreMode,documents:[]});
     status('MASTER 자동 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
   }
 
@@ -236,7 +274,7 @@
   // Google drive.file may require a one-time Picker grant for each newly published generation.
   async function refreshCurrentMaster(manual=false){
     if(state.refreshing)return;
-    if(!state.token || Date.now()>=tokenExpiry){if(manual)status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);return;}
+    if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();if(manual){status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);setScoreStatus('재인증 필요','Google 로그인이 만료됐습니다. 다시 로그인해 주세요. · 기존 정상 데이터 유지');}return;}
     if(!state.fileIds.masterPointer){if(manual)status('MASTER 포인터부터 선택해 주세요.',true);return;}
     const session=scoreSession;state.refreshing=true;
     try{
@@ -262,40 +300,145 @@
     const items=Array.from(event.target.files||[]);
     if(!items.length)return;
     let count=0;
+    const previous={files:state.files,ids:state.fileIds,model:state.model,mode:state.mode,scoreMode:state.scoreMode,documents:scoreSession.documents,cohort:state.selectedCohort,key:state.selectedKey};
     try{
       // Loaded JSON is never sent over the network, and is not retained in browser storage.
+      const files={...state.files},ids={...state.fileIds};
+      if(state.scoreMode==='fixed')files.scoreSnapshot=null;
       for(const f of items){
         if(f.size>15*1024*1024)throw Error(`${f.name}: 파일 15MB 제한을 초과했습니다.`);
         const obj=JSON.parse(await f.text());const type=detectType(obj);
+        if(obj?.kind===FIXED_SCORE_KIND)throw fixedError('USE_FIXED_PICKER');
         if(!type)throw Error(`${f.name}: 지원하지 않는 Stock30 JSON 형식입니다.`);
-        state.files[type]=obj;delete state.fileIds[type];count++;
+        files[type]=obj;delete ids[type];count++;
       }
-      state.mode='local';assemble();updateConnection();
+      state.files=files;state.fileIds=ids;state.mode='local';state.scoreMode='snapshot';scoreSession.documents=[];assemble();updateConnection();
       status(`${count}개 파일을 이 브라우저 안에서 읽었습니다.${state.model?' 검증된 데이터로 대시보드를 표시합니다.':' MASTER 포인터·생성본 두 파일이 필요합니다.'}`);
-    }catch(e){state.model=null;renderAll();showError('로컬 JSON 읽기',e)}finally{event.target.value=''}
+    }catch(e){state.files=previous.files;state.fileIds=previous.ids;state.model=previous.model;state.mode=previous.mode;state.scoreMode=previous.scoreMode;scoreSession.documents=previous.documents;state.selectedCohort=previous.cohort;state.selectedKey=previous.key;renderAll();showError('로컬 JSON 읽기',e)}finally{event.target.value=''}
   }
-  function clearData(){scoreSession=newScoreSession();masterRequest++;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';renderAll();updateConnection()}
+  function clearData(){scoreSession=newScoreSession();masterRequest++;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';state.scoreMode='snapshot';renderAll();updateConnection()}
   function safeParse(s,name){try{return JSON.parse(s)}catch(_){throw Error(`${name} 내부 JSON 파싱 실패`)}}
   function scoreDocuments(files=state.files,ids=state.fileIds,documents=scoreSession.documents){
     const result=[...documents];
-    if(files.scoreSnapshot && !result.some(d=>ids.scoreSnapshot && d.id===ids.scoreSnapshot))result.push({id:ids.scoreSnapshot||'manual-local',name:scoreSession.cache.get(ids.scoreSnapshot)?.name||'수동 점수 스냅샷',mode:'manual',data:files.scoreSnapshot});
+    const selectedId=files.scoreSnapshot?.kind===FIXED_SCORE_KIND?ids.fixedScore:ids.scoreSnapshot;
+    if(files.scoreSnapshot && !result.some(d=>selectedId && d.id===selectedId))result.push({id:selectedId||'manual-local',name:scoreSession.cache.get(selectedId)?.name||'수동 점수 스냅샷',mode:'manual',data:files.scoreSnapshot});
     return result;
   }
   function ensureSession(session){if(session!==scoreSession)throw Error('연결 세션 변경');}
-  async function scoreMetadata(id){return authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?fields=id,name,version,size,modifiedTime&supportsAllDrives=true`);}
-  async function readScoreFile(meta,session=scoreSession){
+  async function scoreMetadata(id,stage='snapshot_metadata'){return authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?fields=id,name,version,size,modifiedTime&supportsAllDrives=true`,stage);}
+  async function readScoreFile(meta,session=scoreSession,source='snapshot'){
     ensureSession(session);
     const version=String(meta.version||meta.modifiedTime||'');
     if(!version || Number(meta.size)>15*1024*1024)throw Error('점수 파일 메타데이터 또는 크기 확인 필요');
     const cached=session.cache.get(meta.id);
     if(cached?.version===version)return cached;
-    const data=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`);
+    const data=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`,source+'_body');
     ensureSession(session);
-    const after=await scoreMetadata(meta.id);ensureSession(session);
+    const after=await scoreMetadata(meta.id,source+'_version');ensureSession(session);
     if(String(after.version||after.modifiedTime||'')!==version)throw Error('점수 업로드 진행 중');
     if(detectType(data)!=='scoreSnapshot' || data.snapshots.some(s=>!s || !Array.isArray(s.records) || s.records.some(r=>!r || typeof r!=='object')))throw Error('점수 파일 업로드 또는 형식 확인 필요');
+    if(data.kind===FIXED_SCORE_KIND)throw fixedError('USE_FIXED_PICKER');
     const document={id:meta.id,name:meta.name,version,mode:'auto',data};
     session.cache.set(meta.id,document);return document;
+  }
+  function fixedError(code){
+    const messages={SCHEMA:'누적 점수 스키마 불일치',ENVIRONMENT:'운영용 누적 점수 파일이 아닙니다',DEFINITIONS:'점수 필드 정의 불일치',PAYLOAD_HASH:'누적 파일 해시 불일치',COHORT_HASH:'누적 코호트 해시 불일치',REFERENCE_HASH:'원천 참조 해시 불일치',COUNT:'누적 점수 부분 업로드 또는 건수 불일치',DATE_COHORT:'선정일·코호트 불일치',DUPLICATE:'누적 코호트·종목 중복',RECORD:'종목코드·순위·점수 레코드 불일치',SCORE:'점수 필드 또는 값 불일치',HISTORY:'기존 정상 코호트 변경 또는 누적 이력 불일치',MASTER_HASH:'공식 LOCK의 선택·참조팩 해시 불일치',MASTER_RECORD:'공식 LOCK의 종목·순위·모델 불일치',SIZE_LIMIT:'누적 파일 12MiB 한도 초과',METADATA:'고정 파일 버전·크기 확인 필요',VERSION_RACE:'고정 파일 업로드 진행 중',JSON_INVALID:'누적 파일 JSON 형식 불일치',BODY_INCOMPLETE:'누적 파일 통신 또는 부분 다운로드',CRYPTO:'안전한 SHA-256 검증을 사용할 수 없습니다',NOT_SELECTED:'고정 누적 파일을 Picker에서 먼저 선택해 주세요',USE_FIXED_PICKER:'누적 JSON은 고정 누적 점수 파일 선택 버튼으로 연결해 주세요'};
+    const error=Error(messages[code]||'누적 점수 검증 실패');error.fixedCode=code;return error;
+  }
+  function fixedCheck(ok,code){if(!ok)throw fixedError(code);}
+  function fixedKeys(value,keys,code='SCHEMA'){fixedCheck(value && typeof value==='object' && !Array.isArray(value) && Object.keys(value).length===keys.length && Object.keys(value).every(k=>keys.includes(k)),code);}
+  function fixedCanonical(value){
+    if(value===null || typeof value==='string' || typeof value==='boolean')return JSON.stringify(value);
+    if(typeof value==='number'){fixedCheck(Number.isFinite(value),'SCHEMA');return JSON.stringify(value);}
+    if(Array.isArray(value))return '['+value.map(fixedCanonical).join(',')+']';
+    fixedCheck(value && typeof value==='object','SCHEMA');
+    return '{'+Object.keys(value).sort().map(k=>JSON.stringify(k)+':'+fixedCanonical(value[k])).join(',')+'}';
+  }
+  function fixedWithout(value,key){const copy={...value};delete copy[key];return copy;}
+  async function fixedDigest(value){
+    fixedCheck(globalThis.crypto?.subtle,'CRYPTO');
+    const bytes=new TextEncoder().encode(fixedCanonical(value));
+    const digest=await crypto.subtle.digest('SHA-256',bytes);
+    return Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');
+  }
+  const fixedHash=value=>typeof value==='string' && /^[a-f0-9]{64}$/.test(value);
+  const fixedDate=value=>typeof value==='string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value+'T00:00:00Z')) && new Date(value+'T00:00:00Z').toISOString().slice(0,10)===value;
+  async function validateFixedPayload(payload){
+    fixedKeys(payload,['kind','schema_version','environment','validation_status','stream_id','revision','previous_payload_sha256','created_at_kst','score_definitions','score_roles','snapshot_count','record_count','snapshots','payload_sha256']);
+    fixedCheck(payload.kind===FIXED_SCORE_KIND && payload.schema_version==='1.0' && payload.validation_status==='PASS','SCHEMA');
+    fixedCheck(payload.environment==='PRODUCTION','ENVIRONMENT');
+    fixedCheck(typeof payload.stream_id==='string' && /^[A-Za-z0-9_-]{8,80}$/.test(payload.stream_id) && Number.isSafeInteger(payload.revision) && payload.revision>=0,'SCHEMA');
+    fixedCheck(typeof payload.created_at_kst==='string' && /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?\+09:00$/.test(payload.created_at_kst) && fixedDate(payload.created_at_kst.slice(0,10)) && Number.isFinite(Date.parse(payload.created_at_kst)),'SCHEMA');
+    fixedCheck(fixedCanonical(payload.score_definitions)===fixedCanonical(SCORE_DEFINITIONS) && fixedCanonical(payload.score_roles)===fixedCanonical(FIXED_SCORE_ROLES),'DEFINITIONS');
+    fixedCheck(fixedHash(payload.payload_sha256) && payload.payload_sha256===await fixedDigest(fixedWithout(payload,'payload_sha256')),'PAYLOAD_HASH');
+    fixedCheck(Array.isArray(payload.snapshots) && payload.snapshot_count===payload.snapshots.length && payload.record_count===payload.snapshots.length*30,'COUNT');
+    fixedCheck(payload.revision===0?(payload.snapshots.length===0 && payload.previous_payload_sha256===null):(payload.snapshots.length>0 && fixedHash(payload.previous_payload_sha256)),'HISTORY');
+    fixedCheck(new TextEncoder().encode(fixedCanonical(payload)).byteLength<=FIXED_SCORE_LIMIT,'SIZE_LIMIT');
+    const definitionsHash=await fixedDigest(SCORE_DEFINITIONS),allowed=[...Object.keys(SCORE_DEFINITIONS),'light_rank_score'];
+    const seen=new Set();let lastDate='';
+    for(const cohort of payload.snapshots){
+      fixedKeys(cohort,['selection_date','cohort_id','record_count','selection_sha256','source_pack_sha256','source_snapshot_sha256','score_definitions_sha256','source_hash_reference_matches','records','cohort_sha256']);
+      fixedCheck(fixedDate(cohort.selection_date) && cohort.cohort_id==='C_'+cohort.selection_date,'DATE_COHORT');
+      fixedCheck(!seen.has(cohort.cohort_id),'DUPLICATE');seen.add(cohort.cohort_id);
+      fixedCheck(cohort.selection_date>lastDate,'DATE_COHORT');lastDate=cohort.selection_date;
+      fixedCheck(cohort.record_count===30 && Array.isArray(cohort.records) && cohort.records.length===30,'COUNT');
+      fixedCheck(fixedHash(cohort.selection_sha256) && fixedHash(cohort.source_pack_sha256) && fixedHash(cohort.source_snapshot_sha256) && cohort.source_hash_reference_matches===true,'REFERENCE_HASH');
+      fixedCheck(cohort.score_definitions_sha256===definitionsHash,'DEFINITIONS');
+      fixedCheck(fixedHash(cohort.cohort_sha256) && cohort.cohort_sha256===await fixedDigest(fixedWithout(cohort,'cohort_sha256')),'COHORT_HASH');
+      const codes=new Set();
+      cohort.records.forEach((row,index)=>{
+        fixedKeys(row,['selection_date','cohort_id','stock_code','selection_rank','scoring_model','score_data_as_of','source_pack_declared_sha256','scores']);
+        fixedCheck(row.selection_date===cohort.selection_date && row.cohort_id===cohort.cohort_id,'DATE_COHORT');
+        fixedCheck(typeof row.stock_code==='string' && /^\d{6}$/.test(row.stock_code),'RECORD');
+        fixedCheck(!codes.has(row.stock_code),'DUPLICATE');codes.add(row.stock_code);
+        fixedCheck(row.selection_rank===index+1 && typeof row.scoring_model==='string' && row.scoring_model.length>0 && fixedDate(row.score_data_as_of) && row.score_data_as_of<=cohort.selection_date,'RECORD');
+        fixedCheck(row.source_pack_declared_sha256===cohort.source_pack_sha256,'REFERENCE_HASH');
+        fixedCheck(row.scores && typeof row.scores==='object' && !Array.isArray(row.scores) && Object.keys(row.scores).every(k=>allowed.includes(k)),'SCORE');
+        for(const value of Object.values(row.scores))fixedCheck(value===null || (typeof value==='number' && Number.isFinite(value) && value>=0 && value<=100),'SCORE');
+      });
+    }
+    return payload;
+  }
+  function validateFixedHistory(payload,previous){
+    if(!previous)return;
+    fixedCheck(payload.stream_id===previous.stream_id,'HISTORY');
+    if(payload.payload_sha256===previous.payload_sha256)return;
+    fixedCheck(payload.revision>previous.revision && payload.snapshots.length>previous.snapshots.length,'HISTORY');
+    if(payload.revision===previous.revision+1)fixedCheck(payload.previous_payload_sha256===previous.payload_sha256,'HISTORY');
+    previous.snapshots.forEach((cohort,index)=>fixedCheck(fixedCanonical(cohort)===fixedCanonical(payload.snapshots[index]),'HISTORY'));
+  }
+  function validateFixedMaster(payload,locks){
+    const master=new Map();
+    for(const lock of locks){const key=lock.selection_date+'|'+lock.cohort_id;fixedCheck(!master.has(key),'MASTER_RECORD');master.set(key,lock);}
+    for(const cohort of payload.snapshots){
+      const lock=master.get(cohort.selection_date+'|'+cohort.cohort_id);if(!lock)continue;
+      fixedCheck(lock.locked===true && lock.status==='OFFICIAL' && Array.isArray(lock.stocks) && lock.stocks.length===30,'MASTER_RECORD');
+      fixedCheck(lock.sha256===cohort.selection_sha256 && lock.MORNING_PACK_SHA256===cohort.source_pack_sha256,'MASTER_HASH');
+      const codes=new Set(),ranks=new Set();
+      for(const stock of lock.stocks){fixedCheck(typeof stock.stock_code==='string' && /^\d{6}$/.test(stock.stock_code) && Number.isInteger(stock.rank) && stock.rank>=1 && stock.rank<=30 && stock.top5===(stock.rank<=5) && !codes.has(stock.stock_code) && !ranks.has(stock.rank),'MASTER_RECORD');codes.add(stock.stock_code);ranks.add(stock.rank);}
+      for(const row of cohort.records){const stock=lock.stocks.find(s=>s.stock_code===row.stock_code);fixedCheck(stock && stock.rank===row.selection_rank && lock.model_version===row.scoring_model,'MASTER_RECORD');}
+    }
+  }
+  async function readFixedScore(id,session=scoreSession){
+    fixedCheck(typeof id==='string' && /^[A-Za-z0-9_-]{1,200}$/.test(id),'NOT_SELECTED');ensureSession(session);
+    if(session.fixedInflight.has(id))return session.fixedInflight.get(id);
+    const operation=(async()=>{
+      const meta=await scoreMetadata(id,'fixed_snapshot_metadata');ensureSession(session);
+      const version=String(meta.version||''),size=Number(meta.size);
+      fixedCheck(meta.id===id && /^\d+$/.test(version) && Number.isSafeInteger(size) && size>0,'METADATA');fixedCheck(size<=FIXED_SCORE_LIMIT,'SIZE_LIMIT');
+      const cached=session.fixedCache.get(id);if(cached?.version===version)return cached;
+      const data=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`,'fixed_snapshot_body',FIXED_SCORE_LIMIT);ensureSession(session);
+      await validateFixedPayload(data);ensureSession(session);
+      const after=await scoreMetadata(id,'fixed_snapshot_version');ensureSession(session);
+      fixedCheck(after.id===id && String(after.version||'')===version && Number(after.size)===size,'VERSION_RACE');
+      const document={id,name:'고정 누적 점수',version,mode:'auto',data,size};session.fixedCache.set(id,document);return document;
+    })();
+    session.fixedInflight.set(id,operation);
+    try{return await operation;}finally{session.fixedInflight.delete(id);}
+  }
+  async function useSnapshotMode(){
+    const cached=scoreSession.cache.get(state.fileIds.scoreSnapshot);
+    await connectScores(true,{files:{...state.files,scoreSnapshot:cached?.data||null},ids:{...state.fileIds},mode:state.mode,scoreMode:'snapshot',documents:[]});
   }
   async function scanScoreFiles(force=false){
     const session=scoreSession;
@@ -303,7 +446,7 @@
     if(!force && session.lastScan && Date.now()-session.lastScan<60000)return session.scanDocuments||session.documents;
     session.inflight=(async()=>{
       if(!session.folderOK){
-        const folder=await authFetch(`https://www.googleapis.com/drive/v3/files/${SCORE_FOLDER_ID}?fields=id,mimeType&supportsAllDrives=true`);ensureSession(session);
+        const folder=await authFetch(`https://www.googleapis.com/drive/v3/files/${SCORE_FOLDER_ID}?fields=id,mimeType&supportsAllDrives=true`,'folder_metadata');ensureSession(session);
         if(folder.mimeType!=='application/vnd.google-apps.folder')throw Error('점수 폴더 확인 필요');
         session.folderOK=true;
       }
@@ -311,7 +454,7 @@
       for(let page=0;page<3;page++){
         const params=new URLSearchParams({q:`'${SCORE_FOLDER_ID}' in parents and trashed = false and name contains 'Stock30_LEARNING_SCORE_SNAPSHOT_'`,fields:'nextPageToken,incompleteSearch,files(id,name,version,size,modifiedTime)',pageSize:'50',spaces:'drive',supportsAllDrives:'true',includeItemsFromAllDrives:'true'});
         if(pageToken)params.set('pageToken',pageToken);
-        const listed=await authFetch(`https://www.googleapis.com/drive/v3/files?${params}`);ensureSession(session);
+        const listed=await authFetch(`https://www.googleapis.com/drive/v3/files?${params}`,'snapshot_list');ensureSession(session);
         if(listed.incompleteSearch || !Array.isArray(listed.files))throw Error('점수 폴더 조회 미완료');
         metadata.push(...listed.files.filter(f=>SCORE_FILENAME.test(f.name||'')));
         pageToken=listed.nextPageToken||'';if(!pageToken)break;
@@ -346,20 +489,64 @@
     return '';
   }
   function setScoreStatus(status,message){scoreSession.status=status;scoreSession.message=message;renderScoreConnection();}
+  function scoreDiagnostic(error){
+    const labels={folder_metadata:'폴더 메타데이터',snapshot_list:'점수 파일 목록',snapshot_metadata:'점수 파일 메타데이터',snapshot_body:'점수 파일 본문',snapshot_version:'점수 파일 버전',selected_snapshot_metadata:'선택 파일 메타데이터',selected_snapshot_body:'선택 파일 본문',selected_snapshot_version:'선택 파일 버전',fixed_snapshot_metadata:'고정 파일 메타데이터',fixed_snapshot_body:'고정 파일 본문',fixed_snapshot_version:'고정 파일 버전'};
+    return `${labels[error.stage]||'Google 요청'} · HTTP ${Number(error.status)||'응답 없음'} · ${(error.reasons||['UNKNOWN_REASON']).join(', ')}`;
+  }
   function scoreFailure(error){
-    if(error?.status===403 || error?.status===404)return '폴더 또는 점수 파일 조회 권한 부족 · 권한을 확대하지 않습니다. 보조 데이터에서 수동 선택해 주세요.';
+    const reasons=error?.reasons||[];
+    if(reasons.some(r=>['accessNotConfigured','SERVICE_DISABLED','API_KEY_INVALID','API_KEY_HTTP_REFERRER_BLOCKED','API_KEY_SERVICE_BLOCKED'].includes(r)))return 'Google API 또는 프로젝트 설정 오류 · Drive API 사용 설정을 확인해 주세요.';
+    if(reasons.includes('ACCESS_TOKEN_SCOPE_INSUFFICIENT'))return '현재 토큰의 요청 범위 부족 · scope를 자동 확대하지 않습니다.';
+    if(reasons.includes('appNotAuthorizedToFile'))return '해당 파일의 앱 접근 미승인 · Picker에서 그 파일을 선택해야 합니다.';
     if(error?.status===401 || !state.token)return 'Google 인증 확인 필요 · 다시 로그인해 주세요.';
+    if(error?.status===429 || reasons.some(r=>['rateLimitExceeded','userRateLimitExceeded','dailyLimitExceeded'].includes(r)))return 'Google API 호출 한도 초과 · 잠시 후 수동 재시도해 주세요.';
+    if(error?.status===404)return '대상 폴더·파일을 찾거나 현재 앱으로 읽을 수 없습니다. ID·삭제 여부·앱 접근 승인을 확인해 주세요.';
+    if(error?.status===403)return '해당 요청 권한 거부 · 아래 실패 단계와 사유 코드를 확인해 주세요. 권한을 자동 확대하지 않습니다.';
     return '점수 자동 연결 실패 또는 부분 업로드 · 기존 정상 데이터 유지 · 잠시 후 재시도해 주세요.';
   }
   async function connectScores(force=false,proposal=null){
     const session=scoreSession,request=++masterRequest;
-    const files=proposal?.files||state.files,ids=proposal?.ids||state.fileIds,mode=proposal?.mode||state.mode;
+    let files=proposal?.files||state.files;
+    const ids=proposal?.ids||state.fileIds,mode=proposal?.mode||state.mode;
+    const scoreMode=proposal?.scoreMode||state.scoreMode;
     if(!files.masterPointer || !files.generation)return;
-    let documents=proposal?.documents||session.documents,error=null;
-    previewModel(files,ids,documents); // Validate MASTER before any score requests.
-    if(mode==='drive' && state.token){
+    let documents=proposal?.documents||session.documents,error=null,selectedChecked=false;
+    let fixedDocument=null;
+    const masterCandidate=previewModel({...files,scoreSnapshot:null},ids,[]); // Validate MASTER before any score requests.
+    if(scoreMode==='fixed'){
+      session.diagnostics=[];setScoreStatus('확인 중','승인한 고정 누적 파일을 확인하고 있습니다.');
+      try{
+        fixedCheck(mode==='drive','NOT_SELECTED');
+        fixedDocument=proposal?.fixedDocument||await readFixedScore(ids.fixedScore,session);ensureSession(session);
+        fixedCheck(fixedDocument.id===ids.fixedScore,'NOT_SELECTED');
+        validateFixedHistory(fixedDocument.data,session.fixedAccepted.get(ids.fixedScore)?.data);
+        validateFixedMaster(fixedDocument.data,masterCandidate.master.locked_selections||[]);
+        files={...files,scoreSnapshot:fixedDocument.data};documents=[fixedDocument];
+      }catch(e){
+        if(session!==scoreSession || request!==masterRequest)return;
+        session.checkedAt=new Date().toISOString();
+        if(e.stage)session.diagnostics.push(scoreDiagnostic(e));
+        // A failed optional score must not prevent the first valid MASTER from opening.
+        if(!state.model){state.files={...files,scoreSnapshot:null};state.fileIds=ids;state.mode=mode;state.scoreMode='fixed';session.documents=[];assemble();rememberFiles();updateConnection();}
+        const reason=e.fixedCode?e.message:scoreFailure(e);
+        setScoreStatus(e.fixedCode?.includes('HASH')?'해시 불일치':e.status===401?'재인증 필요':[403,404].includes(e.status)?'파일 접근 확인':'연결 보류',reason+' · 기존 정상 데이터 유지'+([403,404].includes(e.status)?' · 고정 파일을 Picker에서 다시 선택해 주세요.':''));
+        return;
+      }
+    }else if(mode==='drive' && state.token){
+      session.diagnostics=[];
       setScoreStatus('확인 중','허용된 점수 파일의 연결 상태를 확인하고 있습니다.');
-      try{documents=await scanScoreFiles(force)}catch(e){error=e;}
+      try{documents=await scanScoreFiles(force)}catch(e){error=e;session.diagnostics.push(scoreDiagnostic(e));}
+      // Re-read only the exact file the user already approved with Picker. This grants no access to new IDs.
+      const selectedId=ids.scoreSnapshot;
+      const permissionFailure=error && [403,404].includes(error.status) && !error.reasons?.some(r=>['ACCESS_TOKEN_SCOPE_INSUFFICIENT','accessNotConfigured','SERVICE_DISABLED','API_KEY_INVALID','API_KEY_HTTP_REFERRER_BLOCKED','API_KEY_SERVICE_BLOCKED','rateLimitExceeded','userRateLimitExceeded','dailyLimitExceeded','domainPolicy'].includes(r));
+      if(selectedId && state.token && ((permissionFailure && ['folder_metadata','snapshot_list'].includes(error.stage)) || (!error && !documents.some(d=>d.id===selectedId)))){
+        try{
+          const selected=await readScoreFile(await scoreMetadata(selectedId,'selected_snapshot_metadata'),session,'selected_snapshot');ensureSession(session);
+          files={...files,scoreSnapshot:selected.data};
+          documents=documents.map(d=>d.id===selectedId?selected:d);
+          selectedChecked=true;
+        }catch(e){error=error||e;session.diagnostics.push(scoreDiagnostic(e));}
+      }
     }
     if(session!==scoreSession || request!==masterRequest)return;
     session.checkedAt=new Date().toISOString();
@@ -371,23 +558,33 @@
       for(const c of newCohorts){const rows=candidate.cohorts.find(x=>x.date===c.selection_date && x.cohortId===c.cohort_id)?.stocks||[];if(rows.length!==30 || rows.some(s=>!s.score))issue='새 공식 MASTER의 점수 스냅샷 준비 대기';}
     }
     if(issue){setScoreStatus(/해시/.test(issue)?'해시 불일치':'연결 보류',`${issue} · 기존 정상 데이터 유지`);return;}
-    state.files=files;state.fileIds=ids;state.mode=mode;session.documents=documents;
+    state.files=files;state.fileIds=ids;state.mode=mode;state.scoreMode=scoreMode;session.documents=documents;
+    if(fixedDocument)session.fixedAccepted.set(ids.fixedScore,fixedDocument);
     assemble();rememberFiles();updateConnection();
     const relevant=state.model.cohorts.flatMap(c=>c.stocks);
     const invalid=relevant.find(s=>s.scoreIssue && !/미연결|원천 없음|MASTER에 없는/.test(s.scoreIssue));
     const count=relevant.filter(s=>s.score).length;
-    if(error)setScoreStatus('자동 미연결',scoreFailure(error)+(count?' · 기존 또는 수동 연결 유지':''));
+    if(fixedDocument)setScoreStatus(count?'고정 ID 자동 연결 성공':'고정 ID 연결 · 점수 대기',`MASTER에 포함된 ${count}건 연결 · 누적 revision ${fixedDocument.data.revision}`+(count?'':' · MASTER와 일치하는 점수 원천 없음')+(fixedDocument.size>=8*1024*1024?' · 파일 크기 증가: 보관 전환 준비 필요':''));
+    else if(error)setScoreStatus('자동 미연결',scoreFailure(error)+(selectedChecked?' · 승인된 선택 파일 자동 확인 완료':count?' · 기존 또는 수동 연결 유지':''));
     else if(invalid)setScoreStatus(/해시/.test(invalid.scoreIssue)?'해시 불일치':'검증 불일치',`${invalid.scoreIssue} · 해당 값은 미수집`);
     else setScoreStatus(count?(relevant.some(s=>s.score?.__mode==='auto')?'자동 연결 성공':'수동 연결 · 자동 미연결'):'미연결',count?`MASTER에 포함된 ${count}건 연결 · 조회에서 보이지 않는 파일은 수동 선택이 필요할 수 있습니다.`:'허용된 조회 결과에 해당 코호트 점수 없음 · 보조 데이터에서 수동 선택해 주세요.');
   }
   function renderScoreConnection(){
     if(!$('scoreConnectionStatus'))return;
     $('scoreConnectionStatus').textContent=`점수 ${scoreSession.status}`;
+    if($('scoreModeLabel'))$('scoreModeLabel').textContent='연결 방식: '+(state.scoreMode==='fixed'?'고정 ID 누적 파일':'기존 스냅샷');
+    if($('scoreFixedState')){
+      const accepted=scoreSession.fixedAccepted.get(state.fileIds.fixedScore);
+      $('scoreFixedState').textContent=state.scoreMode==='fixed'?(accepted?`정상 수용 revision ${accepted.data.revision} · 누적 ${accepted.data.snapshot_count}개 코호트 / ${accepted.data.record_count}건 · 본문은 이 세션에만 보관`:'고정 파일 연결 확인 필요 · 최초 선택 또는 Picker 재선택'):'기존 폴더 조회·수동 스냅샷 선택을 사용합니다.';
+    }
     $('scoreConnectionMessage').textContent=scoreSession.message;
+    if($('scoreConnectionDiagnostic'))$('scoreConnectionDiagnostic').textContent=scoreSession.diagnostics.join(' / ');
     const connected=(state.model?.cohorts||[]).filter(c=>c.stocks.some(s=>s.score));
     $('scoreConnectedCohorts').textContent=connected.length?connected.map(c=>`${c.date} / ${c.cohortId} (${c.stocks.filter(s=>s.score).length}/${c.stocks.length}건) · ${[...new Set(c.stocks.filter(s=>s.score).map(s=>s.score.__source))].join(', ')}`).join(' · '):'연결 코호트 없음';
     $('scoreConnectionChecked').textContent='마지막 연결 확인: '+(scoreSession.checkedAt?new Date(scoreSession.checkedAt).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' KST':'—');
     $('retryScoresBtn').disabled=!state.token || state.mode!=='drive' || scoreSession.status==='확인 중';
+    if($('pickFixedScoreBtn'))$('pickFixedScoreBtn').disabled=!state.token || scoreSession.status==='확인 중';
+    if($('useSnapshotModeBtn'))$('useSnapshotModeBtn').disabled=!state.token || state.scoreMode!=='fixed' || scoreSession.status==='확인 중';
   }
 
   function assemble(render=true){
