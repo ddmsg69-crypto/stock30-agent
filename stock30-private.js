@@ -13,9 +13,11 @@
   const fmtDay = x => typeof x==='string' && /^\d{4}-\d{2}-\d{2}$/.test(x)?x:'—';
   const k = (obj,key) => obj && Object.prototype.hasOwnProperty.call(obj,key) ? obj[key] : undefined;
   const EMPTY = Object.freeze({masterPointer:null,generation:null,lock:null,scoreSnapshot:null});
+  const web = window.Stock30WebToday;
   const state = {
     token:'',email:'',config:null,pickerLoaded:false,files:{...EMPTY},fileIds:{},mode:'none',refreshing:false,
-    model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:'',scoreMode:'snapshot'
+    model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:'',scoreMode:'snapshot',
+    masterRaw:null,masterStatus:'미연결',masterCheckedAt:'',masterAcceptedAt:'',lastAutoCheck:0
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
   // Public web-OAuth client identifier (not a credential). Never embed secrets or access tokens.
@@ -34,6 +36,7 @@
   const GOOGLE_ERROR_REASONS = new Set(['authError','notFound','appNotAuthorizedToFile','insufficientPermissions','ACCESS_TOKEN_SCOPE_INSUFFICIENT','accessNotConfigured','SERVICE_DISABLED','API_KEY_INVALID','API_KEY_HTTP_REFERRER_BLOCKED','API_KEY_SERVICE_BLOCKED','domainPolicy','rateLimitExceeded','userRateLimitExceeded','dailyLimitExceeded','PERMISSION_DENIED','UNAUTHENTICATED']);
   let scoreSession = newScoreSession();
   let masterRequest = 0;
+  let scoreRequest = 0;
   let pendingPointer = null;
   let tokenClient = null;
   let tokenExpiry = 0;
@@ -95,6 +98,42 @@
       const d=e.target.closest('[data-cohort]');if(d){state.selectedCohort=d.dataset.cohort;state.tab='stocks';state.filter='all';state.selectedKey='';renderAll()}
     });
     updateConnection();renderAll();
+    setInterval(()=>{if(document.visibilityState==='visible')automaticRefresh()},300000);
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')automaticRefresh()});
+  }
+  function renderMasterStatus(){
+    const stamp=value=>value?new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' KST':'—';
+    $('masterRefreshStatus').textContent=`MASTER 기준일 ${state.model?.pointer.as_of||'미연결'} · 표시 선정일 ${currentCohort()?.date||'미연결'} · ${state.masterStatus} · 실제 반영 ${stamp(state.masterAcceptedAt)} · 마지막 확인 ${stamp(state.masterCheckedAt)}`;
+  }
+  function masterFailure(){state.masterCheckedAt=new Date().toISOString();state.masterStatus='갱신 보류 · 이전 정상 화면 유지';renderMasterStatus();}
+  async function automaticRefresh(){
+    if(state.mode!=='drive'||document.visibilityState!=='visible'||state.refreshing)return;
+    if(state.lastAutoCheck && Date.now()-state.lastAutoCheck<60000)return;
+    state.lastAutoCheck=Date.now();await refreshCurrentMaster(false);
+  }
+  function startScoreRefresh(force=false){
+    // Optional I/O never holds the MASTER refresh lock or delays its accepted screen.
+    const session=scoreSession;
+    void connectScores(force).catch(e=>{if(e && session===scoreSession && state.model)setScoreStatus('연결 보류','점수 확인 실패 · 공식 성과와 기존 정상 점수 유지');});
+  }
+  async function acceptMaster(pointerRaw,generationRaw,ids,mode,session=scoreSession,request=masterRequest){
+    const result=await web.validateMaster(pointerRaw,generationRaw);
+    ensureSession(session);if(request!==masterRequest)return false;
+    if(ids.generation && ids.generation!==result.pointer.location)throw Error('MASTER Generation 파일 연결 불일치');
+    if(state.model?.pointer.as_of>result.pointer.as_of)throw Error('MASTER 날짜 역행 차단');
+    const ext=state.files.lock;
+    const embedded=result.master.locked_selections.find(c=>c.selection_date===ext?.selection_date);
+    if(embedded && embedded.sha256!==ext.sha256)throw Error('MASTER와 기존 공식 LOCK 충돌');
+    const files={...state.files,masterPointer:result.pointer,generation:result.generation};
+    const candidate=previewModel(files,ids,session.documents);
+    const changed=state.model?.pointer.generation!==candidate.pointer.generation;
+    const previousLatest=state.model?.cohorts.at(-1)?.date||'';
+    scoreRequest++;state.files=files;state.fileIds=ids;state.mode=mode;state.masterRaw={pointer:pointerRaw,generation:generationRaw};
+    state.model=candidate;
+    if(candidate.cohorts.at(-1)?.date>previousLatest)state.selectedCohort=candidate.cohorts.at(-1).date;
+    state.masterCheckedAt=new Date().toISOString();if(changed)state.masterAcceptedAt=state.masterCheckedAt;
+    state.masterStatus=changed?'자동 갱신 PASS':'최신 정상본 확인';
+    assemble();rememberFiles();updateConnection();return true;
   }
   function updateConnection(){
     const connected=!!state.token && Date.now()<tokenExpiry;
@@ -145,11 +184,13 @@
     // Clear local auth state. Google account's app grants are NOT revoked.
     state.token='';state.email='';tokenExpiry=0;clearData();updateConnection();status('브라우저 인증 상태를 종료했습니다. Google 계정 권한 자체는 유지됩니다.');
   }
-  async function authFetch(url,stage='google_request',maxBytes=0){
+  async function authFetch(url,stage='google_request',maxBytes=0,raw=false){
     if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();const error=Error('인증이 만료됐습니다. Google에 다시 로그인해 주세요.');error.status=401;error.stage=stage;error.reasons=['authError'];throw error;}
+    const requestToken=state.token;
     let r;
     try{r=await fetch(url,{headers:{Authorization:`Bearer ${state.token}`},cache:'no-store',redirect:'error',signal:typeof AbortSignal!=='undefined'?AbortSignal.timeout(15000):undefined});}
     catch(_){const error=Error('Google 요청 통신 또는 시간 초과');error.stage=stage;error.reasons=['NETWORK_OR_TIMEOUT'];throw error;}
+    if(state.token!==requestToken)throw Error('인증 세션 변경 · 이전 응답 무시');
     if(!r.ok){
       let body=null;try{body=await r.json()}catch(_){}
       const reasons=[...(Array.isArray(body?.error?.errors)?body.error.errors.map(e=>e?.reason):[]),...(Array.isArray(body?.error?.details)?body.error.details.map(e=>e?.reason):[])];
@@ -171,7 +212,7 @@
       const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}
       try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch(_){throw fixedError('JSON_INVALID');}
     }
-    try{return await r.json()}catch(_){throw Error('Google 파일 JSON 형식 확인 필요');}
+    try{return raw?await r.text():await r.json()}catch(_){throw Error('Google 파일 JSON 형식 확인 필요');}
   }
   async function loadPicker(){
     if(window.google?.picker)return;
@@ -205,38 +246,52 @@
     }catch(e){showError('Google 파일 선택기',e)}
   }
   async function ingestDriveFile(kind,id,name){
-    const session=scoreSession;
+    const session=scoreSession,request=['masterPointer','generation'].includes(kind)?++masterRequest:masterRequest;
     try{
       status(`${name||'선택한 파일'} 읽는 중...`);
       if(kind==='fixedScore'){
         const document=await readFixedScore(id,session);ensureSession(session);
-        const files={...state.files,scoreSnapshot:document.data},ids={...state.fileIds,fixedScore:id};
-        if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';state.scoreMode='fixed';session.documents=[document];rememberFiles();updateConnection();setScoreStatus('MASTER 대기','고정 누적 파일 검증 완료 · MASTER를 연결해 주세요.');return;}
-        await connectScores(false,{files,ids,mode:'drive',scoreMode:'fixed',documents:[document],fixedDocument:document});return;
+        await connectScores(false,{files:{...state.files,scoreSnapshot:document.data},ids:{...state.fileIds,fixedScore:id},mode:'drive',scoreMode:'fixed',documents:[document],fixedDocument:document});return;
       }
       const snapshot=kind==='extra' && SCORE_FILENAME.test(name||'');
       const document=snapshot?await readScoreFile(await scoreMetadata(id),session):null;
-      const json=document?.data||await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
-      ensureSession(session);
-      const inferred=detectType(json);
+      const raw=document?null:await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`,'selected_file',0,true);
+      const json=document?.data||JSON.parse(raw);ensureSession(session);
+      const inferred=detectType(json),type=kind==='extra'?inferred:kind;
       if(json?.kind===FIXED_SCORE_KIND)throw fixedError('USE_FIXED_PICKER');
       if(kind!=='extra' && inferred!==kind)throw Error('선택한 파일 형식을 확인해 주세요.');
       if(kind==='extra' && !['lock','scoreSnapshot'].includes(inferred))throw Error('공식 LOCK 또는 학습 점수 JSON을 선택해 주세요.');
-      const type=kind==='extra'?inferred:kind;
-      if(type==='masterPointer' && name && name!=='master_current.json')throw Error('포인터 파일명이 master_current.json이 아닙니다.');
-      if(type==='masterPointer' && state.model && json.generation!==state.model.pointer.generation){
-        pendingPointer={data:json,id};status('새 MASTER 포인터 확인 · 검증 생성본을 선택해 주세요. 기존 화면은 유지됩니다.');return;
+      if(type==='masterPointer'){
+        if(name && name!=='master_current.json')throw Error('포인터 파일명이 master_current.json이 아닙니다.');
+        await web.sealed(raw,'MASTER 포인터');ensureSession(session);
+        if(request!==masterRequest)return;
+        pendingPointer={raw,id};status('MASTER 포인터 확인 · 검증 생성본을 선택해 주세요. 기존 화면은 유지됩니다.');return;
       }
-      const files={...state.files,[type]:json},ids={...state.fileIds,[type]:id};
-      if(type==='generation' && pendingPointer){files.masterPointer=pendingPointer.data;ids.masterPointer=pendingPointer.id;}
-      const documents=type==='scoreSnapshot'?(document?[document]:[]):session.documents;
-      if(!files.masterPointer || !files.generation){state.files=files;state.fileIds=ids;state.mode='drive';if(type==='scoreSnapshot'){state.scoreMode='snapshot';session.documents=documents;}assemble();rememberFiles();updateConnection();status('MASTER 포인터·검증 생성본을 모두 선택해 주세요.');return;}
-      await connectScores(false,{files,ids,mode:'drive',documents,scoreMode:type==='scoreSnapshot'?'snapshot':state.scoreMode});
-      if(state.files.generation===json)pendingPointer=null;
-      status('파일 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
-    }catch(e){if(session===scoreSession){showError('Drive 파일 조회',e);session.checkedAt=new Date().toISOString();setScoreStatus('연결 보류',e.fixedCode?e.message:scoreFailure(e));renderAll();}}
+      if(type==='generation'){
+        const pointer=pendingPointer?.raw||state.masterRaw?.pointer;
+        if(!pointer)throw Error('MASTER 포인터를 먼저 선택해 주세요.');
+        if(!await acceptMaster(pointer,raw,{...state.fileIds,masterPointer:pendingPointer?.id||state.fileIds.masterPointer,generation:id},'drive',session,request))return;
+        pendingPointer=null;startScoreRefresh();return;
+      }
+      if(type==='lock'){
+        await validateLock(raw);ensureSession(session);
+        const files={...state.files,lock:json},ids={...state.fileIds,lock:id};
+        previewModel(files,ids,session.documents);state.files=files;state.fileIds=ids;state.mode='drive';assemble();rememberFiles();updateConnection();return;
+      }
+      await connectScores(false,{files:{...state.files,scoreSnapshot:json},ids:{...state.fileIds,scoreSnapshot:id},mode:'drive',documents:document?[document]:[],scoreMode:'snapshot'});
+    }catch(e){if(session===scoreSession && (!['masterPointer','generation'].includes(kind) || request===masterRequest)){
+      if(['masterPointer','generation'].includes(kind)){masterFailure();showError('MASTER 파일 확인',e);}
+      else{showError('Drive 파일 조회',e);session.checkedAt=new Date().toISOString();setScoreStatus('연결 보류',e.fixedCode?e.message:scoreFailure(e));}
+    }}
   }
-
+  async function validateLock(raw){
+    const lock=await web.sealed(raw,'Official LOCK');web.official(lock,lock.selection_date);
+    if(lock.selection_date>web.today() || state.files.lock?.selection_date>lock.selection_date)throw Error('공식 LOCK 날짜 오류');
+    const previous=state.model?.master.locked_selections.find(c=>c.selection_date===lock.selection_date)||
+      (state.files.lock?.selection_date===lock.selection_date?state.files.lock:null);
+    if(previous && previous.sha256!==lock.sha256)throw Error('기존 공식 LOCK 해시 충돌');
+    return lock;
+  }
   function rememberFiles(){
     if(!state.email||state.mode!=='drive')return;
     try{localStorage.setItem(FILE_CACHE_KEY,JSON.stringify({email:state.email,ids:{...state.fileIds},scoreMode:state.scoreMode,savedAt:new Date().toISOString()}))}
@@ -247,47 +302,41 @@
     status('이 기기에 저장된 파일 연결 기록을 지웠습니다. 다음 방문 시 파일을 다시 선택해 주세요.');
   }
   async function restoreRememberedFiles(){
-    const session=scoreSession;
+    const session=scoreSession,request=++masterRequest;
     let cached=null;
     try{cached=JSON.parse(localStorage.getItem(FILE_CACHE_KEY)||'null')}catch(_){}
     if(!cached || cached.email!==state.email || !cached.ids?.masterPointer){status('Google 로그인 완료 · MASTER 포인터와 검증 생성본을 선택해 주세요.');return;}
-    const fetchId=id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`);
-    const pointer=await fetchId(cached.ids.masterPointer);ensureSession(session);
-    if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS' || !/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('저장된 MASTER 포인터 확인 필요');
-    const generation=await fetchId(pointer.location);ensureSession(session);
-    const files={...EMPTY,masterPointer:pointer,generation},ids={masterPointer:cached.ids.masterPointer,generation:pointer.location};
-    const scoreMode=cached.scoreMode==='fixed'?'fixed':'snapshot';
-    if(scoreMode==='fixed' && typeof cached.ids.fixedScore==='string')ids.fixedScore=cached.ids.fixedScore;
-    for(const type of ['lock','scoreSnapshot']){
-      if(type==='scoreSnapshot' && scoreMode==='fixed')continue;
-      const id=cached.ids[type];if(!id)continue;
-      try{
-        const extra=type==='scoreSnapshot'?(await readScoreFile(await scoreMetadata(id),session)).data:await fetchId(id);
-        ensureSession(session);if(detectType(extra)===type){files[type]=extra;ids[type]=id;}
-      }catch(_){ensureSession(session);/* Optional files never prevent a read-only MASTER view. */}
-    }
-    await connectScores(false,{files,ids,mode:'drive',scoreMode,documents:[]});
-    status('MASTER 자동 연결 확인 완료 · 점수 연결 상태를 확인해 주세요.');
+    try{
+      const fetchId=id=>authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`,'master_restore',0,true);
+      const pointerRaw=await fetchId(cached.ids.masterPointer);ensureSession(session);
+      const pointer=await web.sealed(pointerRaw,'MASTER 포인터');ensureSession(session);
+      if(detectType(pointer)!=='masterPointer' || !/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('저장된 MASTER 포인터 확인 필요');
+      const generationRaw=await fetchId(pointer.location);ensureSession(session);
+      const ids={...cached.ids,masterPointer:cached.ids.masterPointer,generation:pointer.location};
+      if(!await acceptMaster(pointerRaw,generationRaw,ids,'drive',session,request))return;
+      state.scoreMode=cached.scoreMode==='fixed'?'fixed':'snapshot';rememberFiles();startScoreRefresh();
+      if(ids.lock){try{
+        const raw=await fetchId(ids.lock);ensureSession(session);const lock=await validateLock(raw);ensureSession(session);
+        if(request!==masterRequest)return;
+        const files={...state.files,lock};previewModel(files,state.fileIds,session.documents);state.files=files;assemble();
+      }catch(_){ensureSession(session);status('공식 LOCK 확인 보류 · 정상 MASTER 유지',true);}}
+    }catch(e){if(session===scoreSession && request===masterRequest){masterFailure();showError('MASTER 자동 불러오기',e);}}
   }
-
-  // Read-only latest pointer check. Never overwrite the displayed model until full validation passes.
-  // Google drive.file may require a one-time Picker grant for each newly published generation.
   async function refreshCurrentMaster(manual=false){
     if(state.refreshing)return;
-    if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();if(manual){status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);setScoreStatus('재인증 필요','Google 로그인이 만료됐습니다. 다시 로그인해 주세요. · 기존 정상 데이터 유지');}return;}
+    if(!state.token || Date.now()>=tokenExpiry){state.token='';tokenExpiry=0;updateConnection();masterFailure();if(manual)status('Google 로그인이 만료됐습니다. 다시 로그인해 주세요.',true);return;}
     if(!state.fileIds.masterPointer){if(manual)status('MASTER 포인터부터 선택해 주세요.',true);return;}
-    const session=scoreSession;state.refreshing=true;
+    const session=scoreSession,request=++masterRequest;state.refreshing=true;state.masterStatus='확인 중 · 이전 정상 화면 유지';renderMasterStatus();
     try{
-      const pointer=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.fileIds.masterPointer)}?alt=media`);ensureSession(session);
-      if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS')throw Error('최신 포인터 검증 PASS가 아닙니다.');
-      if(!/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('generation 파일 ID 확인 필요');
-      const generation=state.model?.pointer.generation===pointer.generation?state.files.generation:await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(pointer.location)}?alt=media`);ensureSession(session);
-      await connectScores(manual,{files:{...state.files,masterPointer:pointer,generation},ids:{...state.fileIds,generation:pointer.location},mode:'drive'});
-      status('MASTER·점수 연결 확인 완료 · 연결 보류 시 기존 정상 화면 유지');
-    }catch(e){if(session===scoreSession){status(`최신 MASTER 확인 실패: ${safeError(e)} · 기존 화면 유지`,true);}}
+      const pointerRaw=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(state.fileIds.masterPointer)}?alt=media`,'master_pointer',0,true);ensureSession(session);
+      const pointer=await web.sealed(pointerRaw,'MASTER 포인터');ensureSession(session);
+      if(detectType(pointer)!=='masterPointer' || pointer.validation_status!=='PASS' || !/^[A-Za-z0-9_-]{10,}$/.test(pointer.location||''))throw Error('최신 포인터 형식 또는 검증 상태 확인 필요');
+      const generationRaw=state.model?.pointer.generation===pointer.generation&&state.masterRaw?state.masterRaw.generation:await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(pointer.location)}?alt=media`,'master_generation',0,true);ensureSession(session);
+      if(await acceptMaster(pointerRaw,generationRaw,{...state.fileIds,generation:pointer.location},'drive',session,request))startScoreRefresh(manual);
+      status('MASTER 확인 완료 · 점수 독립 확인');
+    }catch(e){if(session===scoreSession && request===masterRequest){masterFailure();status(`최신 MASTER 확인 실패: ${safeError(e)} · 기존 화면 유지`,true);}}
     finally{if(session===scoreSession)state.refreshing=false;}
   }
-
   function detectType(a){
     if(!a||typeof a!=='object')return null;
     if(a.kind==='MASTER21_CURRENT'&&typeof a.location==='string'&&a.files)return 'masterPointer';
@@ -299,24 +348,36 @@
   async function localImport(event){
     const items=Array.from(event.target.files||[]);
     if(!items.length)return;
+    const session=scoreSession,request=++masterRequest;
     let count=0;
     const previous={files:state.files,ids:state.fileIds,model:state.model,mode:state.mode,scoreMode:state.scoreMode,documents:scoreSession.documents,cohort:state.selectedCohort,key:state.selectedKey};
     try{
       // Loaded JSON is never sent over the network, and is not retained in browser storage.
-      const files={...state.files},ids={...state.fileIds};
+      const files={...state.files},ids={...state.fileIds},raws={...state.masterRaw};
       if(state.scoreMode==='fixed')files.scoreSnapshot=null;
       for(const f of items){
         if(f.size>15*1024*1024)throw Error(`${f.name}: 파일 15MB 제한을 초과했습니다.`);
-        const obj=JSON.parse(await f.text());const type=detectType(obj);
+        const raw=await f.text(),obj=JSON.parse(raw);const type=detectType(obj);
         if(obj?.kind===FIXED_SCORE_KIND)throw fixedError('USE_FIXED_PICKER');
         if(!type)throw Error(`${f.name}: 지원하지 않는 Stock30 JSON 형식입니다.`);
+        if(type==='lock')await validateLock(raw);
+        if(type==='masterPointer')raws.pointer=raw;
+        if(type==='generation')raws.generation=raw;
         files[type]=obj;delete ids[type];count++;
       }
+      if(files.masterPointer && files.generation){
+        const verified=await web.validateMaster(raws.pointer,raws.generation);
+        if(state.model?.pointer.as_of>verified.pointer.as_of)throw Error('MASTER 날짜 역행 차단');
+        const same=files.lock&&verified.master.locked_selections.find(c=>c.selection_date===files.lock.selection_date);
+        if(same && same.sha256!==files.lock.sha256)throw Error('MASTER와 공식 LOCK 충돌');
+      }
+      if(session!==scoreSession || request!==masterRequest)return;
       state.files=files;state.fileIds=ids;state.mode='local';state.scoreMode='snapshot';scoreSession.documents=[];assemble();updateConnection();
+      scoreRequest++;masterRequest++;state.masterRaw=raws;state.masterCheckedAt=new Date().toISOString();state.masterAcceptedAt=state.masterCheckedAt;state.masterStatus='로컬 검증 PASS';renderMasterStatus();
       status(`${count}개 파일을 이 브라우저 안에서 읽었습니다.${state.model?' 검증된 데이터로 대시보드를 표시합니다.':' MASTER 포인터·생성본 두 파일이 필요합니다.'}`);
-    }catch(e){state.files=previous.files;state.fileIds=previous.ids;state.model=previous.model;state.mode=previous.mode;state.scoreMode=previous.scoreMode;scoreSession.documents=previous.documents;state.selectedCohort=previous.cohort;state.selectedKey=previous.key;renderAll();showError('로컬 JSON 읽기',e)}finally{event.target.value=''}
+    }catch(e){if(session===scoreSession && request===masterRequest){state.files=previous.files;state.fileIds=previous.ids;state.model=previous.model;state.mode=previous.mode;state.scoreMode=previous.scoreMode;scoreSession.documents=previous.documents;state.selectedCohort=previous.cohort;state.selectedKey=previous.key;renderAll();showError('로컬 JSON 읽기',e)}}finally{event.target.value=''}
   }
-  function clearData(){scoreSession=newScoreSession();masterRequest++;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';state.scoreMode='snapshot';renderAll();updateConnection()}
+  function clearData(){scoreSession=newScoreSession();masterRequest++;scoreRequest++;state.masterRaw=null;state.masterStatus='미연결';state.masterCheckedAt='';state.masterAcceptedAt='';state.lastAutoCheck=0;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';state.scoreMode='snapshot';renderAll();updateConnection()}
   function safeParse(s,name){try{return JSON.parse(s)}catch(_){throw Error(`${name} 내부 JSON 파싱 실패`)}}
   function scoreDocuments(files=state.files,ids=state.fileIds,documents=scoreSession.documents){
     const result=[...documents];
@@ -505,14 +566,14 @@
     return '점수 자동 연결 실패 또는 부분 업로드 · 기존 정상 데이터 유지 · 잠시 후 재시도해 주세요.';
   }
   async function connectScores(force=false,proposal=null){
-    const session=scoreSession,request=++masterRequest;
+    const session=scoreSession,request=++scoreRequest;
     let files=proposal?.files||state.files;
     const ids=proposal?.ids||state.fileIds,mode=proposal?.mode||state.mode;
     const scoreMode=proposal?.scoreMode||state.scoreMode;
     if(!files.masterPointer || !files.generation)return;
     let documents=proposal?.documents||session.documents,error=null,selectedChecked=false;
     let fixedDocument=null;
-    const masterCandidate=previewModel({...files,scoreSnapshot:null},ids,[]); // Validate MASTER before any score requests.
+    const masterCandidate=state.model;if(!masterCandidate)return;
     if(scoreMode==='fixed'){
       session.diagnostics=[];setScoreStatus('확인 중','승인한 고정 누적 파일을 확인하고 있습니다.');
       try{
@@ -523,11 +584,9 @@
         validateFixedMaster(fixedDocument.data,masterCandidate.master.locked_selections||[]);
         files={...files,scoreSnapshot:fixedDocument.data};documents=[fixedDocument];
       }catch(e){
-        if(session!==scoreSession || request!==masterRequest)return;
+        if(session!==scoreSession || request!==scoreRequest)return;
         session.checkedAt=new Date().toISOString();
         if(e.stage)session.diagnostics.push(scoreDiagnostic(e));
-        // A failed optional score must not prevent the first valid MASTER from opening.
-        if(!state.model){state.files={...files,scoreSnapshot:null};state.fileIds=ids;state.mode=mode;state.scoreMode='fixed';session.documents=[];assemble();rememberFiles();updateConnection();}
         const reason=e.fixedCode?e.message:scoreFailure(e);
         setScoreStatus(e.fixedCode?.includes('HASH')?'해시 불일치':e.status===401?'재인증 필요':[403,404].includes(e.status)?'파일 접근 확인':'연결 보류',reason+' · 기존 정상 데이터 유지'+([403,404].includes(e.status)?' · 고정 파일을 Picker에서 다시 선택해 주세요.':''));
         return;
@@ -548,17 +607,12 @@
         }catch(e){error=error||e;session.diagnostics.push(scoreDiagnostic(e));}
       }
     }
-    if(session!==scoreSession || request!==masterRequest)return;
+    if(session!==scoreSession || request!==scoreRequest)return;
     session.checkedAt=new Date().toISOString();
     const candidate=previewModel(files,ids,documents);
     let issue=scoreRegression(state.model,candidate);
-    if(state.model && state.model.pointer.generation!==candidate.pointer.generation){
-      const before=new Set(state.model.master.locked_selections.map(c=>c.selection_date+'|'+c.cohort_id));
-      const newCohorts=candidate.master.locked_selections.filter(c=>!before.has(c.selection_date+'|'+c.cohort_id));
-      for(const c of newCohorts){const rows=candidate.cohorts.find(x=>x.date===c.selection_date && x.cohortId===c.cohort_id)?.stocks||[];if(rows.length!==30 || rows.some(s=>!s.score))issue='새 공식 MASTER의 점수 스냅샷 준비 대기';}
-    }
     if(issue){setScoreStatus(/해시/.test(issue)?'해시 불일치':'연결 보류',`${issue} · 기존 정상 데이터 유지`);return;}
-    state.files=files;state.fileIds=ids;state.mode=mode;state.scoreMode=scoreMode;session.documents=documents;
+    state.files={...state.files,scoreSnapshot:files.scoreSnapshot};state.fileIds={...state.fileIds,scoreSnapshot:ids.scoreSnapshot,fixedScore:ids.fixedScore};state.scoreMode=scoreMode;session.documents=documents;
     if(fixedDocument)session.fixedAccepted.set(ids.fixedScore,fixedDocument);
     assemble();rememberFiles();updateConnection();
     const relevant=state.model.cohorts.flatMap(c=>c.stocks);
@@ -580,7 +634,8 @@
     $('scoreConnectionMessage').textContent=scoreSession.message;
     if($('scoreConnectionDiagnostic'))$('scoreConnectionDiagnostic').textContent=scoreSession.diagnostics.join(' / ');
     const connected=(state.model?.cohorts||[]).filter(c=>c.stocks.some(s=>s.score));
-    $('scoreConnectedCohorts').textContent=connected.length?connected.map(c=>`${c.date} / ${c.cohortId} (${c.stocks.filter(s=>s.score).length}/${c.stocks.length}건) · ${[...new Set(c.stocks.filter(s=>s.score).map(s=>s.score.__source))].join(', ')}`).join(' · '):'연결 코호트 없음';
+    const current=currentStocks(),currentCount=current.filter(s=>s.score).length;
+    $('scoreConnectedCohorts').textContent=`표시 선정일 ${currentCohort()?.date||'—'} · 점수 ${currentCount}/${current.length}종${currentCount===0?' 미수집':''} · `+(connected.length?connected.map(c=>`${c.date} / ${c.cohortId} (${c.stocks.filter(s=>s.score).length}/${c.stocks.length}건) · ${[...new Set(c.stocks.filter(s=>s.score).map(s=>s.score.__source))].join(', ')}`).join(' · '):'연결 코호트 없음');
     $('scoreConnectionChecked').textContent='마지막 연결 확인: '+(scoreSession.checkedAt?new Date(scoreSession.checkedAt).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' KST':'—');
     $('retryScoresBtn').disabled=!state.token || state.mode!=='drive' || scoreSession.status==='확인 중';
     if($('pickFixedScoreBtn'))$('pickFixedScoreBtn').disabled=!state.token || scoreSession.status==='확인 중';
@@ -602,10 +657,11 @@
     if(master.as_of!==p.as_of)throw Error('MASTER 포인터 as_of와 generation 본문 날짜가 불일치합니다.');
     if(!Array.isArray(master.database)||master.database.length!==p.record_count)throw Error('MASTER DB 건수가 검증된 포인터 건수와 다릅니다.');
     const db=master.database.map(r=>{
-      const date=String(r['Cohort Date']||'');const id=code(r['Stock Code']);const c=master.data_classification?.[date+'|'+id]||'UNKNOWN';
+      const date=String(r['Cohort Date']||'');const id=code(r['Stock Code']);const c=master.data_classification?.[r.Record_ID]||master.data_classification?.[date+'|'+id]||'UNKNOWN';
       return {...r,__date:date,__code:id,__dataClass:c};
     });
-    const official=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE');
+    const official=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE' && !isD0Observation(r));
+    const observations=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE' && isD0Observation(r));
     const legacy=db.filter(r=>r.__dataClass==='LEGACY_REFERENCE');
     const registered=Array.isArray(master.locked_selections)?master.locked_selections:[];
     const ext=state.files.lock;
@@ -616,14 +672,16 @@
     const scores=scoreIndex(scoreDocuments(),registered);
     const masterByKey=new Map(db.map(r=>[r.__date+'|'+r.__code,r]));
     const cohorts=locked.map(c=>({date:c.selection_date,cohortId:c.cohort_id,stocks:(c.stocks||[]).map(s=>{
-      const record=masterByKey.get(c.selection_date+'|'+code(s.stock_code));
+      const rawRecord=masterByKey.get(c.selection_date+'|'+code(s.stock_code));
+      const observation=isD0Observation(rawRecord)?rawRecord:null;
+      const record=observation?null:rawRecord;
       const candidate=scores.get(scoreKey(c.selection_date,c.cohort_id,s.stock_code));
       const scoreIssue=scoreMismatch(candidate,c,s);
       const score=scoreIssue?null:candidate;
-      return {date:c.selection_date,cohortId:c.cohort_id,rank:Number(s.rank||s['Selection Rank']||0),code:code(s.stock_code),name:s.stock_name||'이름 없음',top5:!!s.top5,reason:s.Selection_Reason||'',record,score,scoreIssue};
+      return {date:c.selection_date,cohortId:c.cohort_id,rank:Number(s.rank||s['Selection Rank']||0),code:code(s.stock_code),name:s.stock_name||'이름 없음',top5:!!s.top5,reason:s.Selection_Reason||'',record,observation,score,scoreIssue};
     })}));
     const latest=cohorts.at(-1);
-    state.model={pointer:p,generation:g,master,board,momentum,top5reason,db,official,legacy,cohorts,scores,masterByKey};
+    state.model={pointer:p,generation:g,master,board,momentum,top5reason,db,official,observations,legacy,cohorts,scores,masterByKey};
     if(render){$('workflowSection').classList.add('compact');$('toggleConnection').textContent='연결 관리 펼치기';$('settingsPanel').hidden=true;}
     if(!state.selectedCohort || !cohorts.some(c=>c.date===state.selectedCohort))state.selectedCohort=latest?.date||'';
     if(!findStock(state.selectedKey))state.selectedKey='';
@@ -634,6 +692,16 @@
   function findStock(key){if(!key)return null;return currentStocks().find(x=>x.date+'|'+x.code===key)||null}
   function chosen(){return findStock(state.selectedKey)||currentStocks()[0]||null}
   function resultType(r){const s=String(r?.['Final Result']||'PENDING').toUpperCase();return ['SUCCESS','FAIL','TRACKING','PENDING'].includes(s)?s:'PENDING'}
+  function isD0Observation(r){
+    return !!r && (r.Hunter_Day_Origin===0 || r.Hunter_Day_Origin==='0' || r.performance_policy==='REVIEW_D0_D4' ||
+      (r['D+1 Date'] && r['D+1 Date']<=r['Cohort Date']) || (r['Reference Date'] && r['Reference Date']<=r['Cohort Date']));
+  }
+  function performanceBadge(s){return s.record?statusBadge(resultType(s.record)):statusBadge(s.observation?'PENDING':'WAIT')}
+  function observationHTML(s){
+    const r=s.observation;if(!r)return '';
+    const dates=Array.from({length:5},(_,i)=>r[`D+${i+1} Date`]?`D${i===0?'0':'+'+i} ${r[`D+${i+1} Date`]}`:'').filter(Boolean).join(' · ');
+    return `<div class="observation-note"><strong>D0 기점 사후 관측 · 공식 D+1~D+5 집계 제외</strong><p>선정일 전체 세션의 사후 관측이며 선정 이후 달성 가능한 수익률이 아닙니다. 공식 추적 성과는 별도 검증 자료 대기입니다.</p><p>${h(dates)} · 원자료 판정 ${h(resultType(r))} · MFE ${h(pct(r['MFE %']))} · MAE ${h(pct(r['MAE %']))} · 기준일 ${h(r['Data As Of']||state.model?.pointer.as_of)}</p></div>`;
+  }
   // Only fields whose meaning was verified in the selection-time score snapshot.
   // No official composite score is present in the investigated sources.
   const SCORE_FIELDS=Object.freeze({total:null,chart:'chart_technical_score_100',momentum:'momentum_score_100',light:'light_rank_score'});
@@ -702,10 +770,10 @@
     const mfe=top.map(x=>num(x['MFE %'])).filter(x=>x!==null);const mae=top.map(x=>num(x['MAE %'])).filter(x=>x!==null);
     const avg=arr=>arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:null;
     $('summary').innerHTML=[
-      stat('Hunter 확정 성공률',r.rate===null?'미확정':r.rate.toFixed(1)+'%',`새 기준 종료 ${r.total}종 · 성공 ${r.win}종`,'◎'),
+      stat('Hunter 확정 성공률',r.rate===null?'미확정':r.rate.toFixed(1)+'%',`D+1~D+5 종료 ${r.total}종 · 성공 ${r.win}종 · D0 제외`,'◎'),
       stat('종합점수','미수집','공식 종합점수 원천 필드 없음 · LIGHT와 구분','♜'),
       stat('DAY별 성공현황',`${m.cohorts.length} DAY`,`실제 관측 성공 ${m.official.filter(x=>resultType(x)==='SUCCESS').length}종 · 확정과 구분`,'▥',dayCounts.map(x=>x/30*100)),
-      stat('ACTIVE 코호트',String(activeDates.size),`공식 새 기준 ${m.official.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
+      stat('ACTIVE 코호트',String(activeDates.size),`공식 추적 ${m.official.length}종 · D0 사후 관측 ${m.observations.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
       stat('TOP5 평균 MFE',avg(mfe)===null?'—':pct(avg(mfe)),`새 기준 관측 종목 ${mfe.length}개 · 최종수익률 아님`,'↗'),
       stat('TOP5 평균 MAE',avg(mae)===null?'—':pct(avg(mae)),`새 기준 관측 종목 ${mae.length}개`,'↘'),
       stat('운영 체크포인트',fmtDay(m.pointer.as_of),`MASTER ${m.db.length}건 · ${m.pointer.validation_status} · 정규 15:40`,'▤')
@@ -739,17 +807,21 @@
     if(state.tab==='learning')return renderLearning();
   }
   function renderStocks(){const list=shownStocks();$('content').innerHTML=`<div class="data-wrap"><table class="stock-table"><thead><tr><th>순위</th><th>종목명 · 코드</th><th>검증 종가</th><th>+3% 목표</th><th>Hunter</th><th>종합점수</th><th>차트·기술</th><th>모멘텀</th><th>LIGHT 점수</th><th>MFE</th><th>MAE</th><th>코호트</th></tr></thead><tbody>${list.map(s=>{
-    const r=s.record;const re=r?resultType(r):'WAIT';return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${statusBadge(re)}</td>${['total','chart','momentum','light'].map(kind=>`<td class="score" title="${h(kind==='total'?'공식 종합점수 원천 필드 없음':scoreNote(s))}">${h(scoreText(s,kind))}</td>`).join('')}<td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="12" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div><p class="muted">점수는 별도 LEARNING_SCORE_SNAPSHOT JSON을 보조 데이터에서 선택하면 연결됩니다. 선정일·코호트·종목코드와 LOCK 참조팩이 일치하는 값만 표시합니다. 종합점수는 미수집이며 LIGHT는 순위 참고점수입니다.</p>`;
+    const r=s.record;const re=r?resultType(r):'WAIT';return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${performanceBadge(s)}${s.observation?'<small class="d0-tag">D0 사후 관측 별도</small>':''}</td>${['total','chart','momentum','light'].map(kind=>`<td class="score" title="${h(kind==='total'?'공식 종합점수 원천 필드 없음':scoreNote(s))}">${h(scoreText(s,kind))}</td>`).join('')}<td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="12" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">MASTER 기준일: ${h(state.model.pointer.as_of)} · 선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div><p class="muted">D0 사후 관측은 종목 상세에서 별도 표시하며 공식 추적 값과 합산하지 않습니다. 점수는 별도 LEARNING_SCORE_SNAPSHOT JSON을 보조 데이터에서 선택하면 연결됩니다. 선정일·코호트·종목코드와 LOCK 참조팩이 일치하는 값만 표시합니다. 종합점수는 미수집이며 LIGHT는 순위 참고점수입니다.</p>`;
     document.querySelectorAll('tr[data-select]').forEach(row=>row.addEventListener('keydown',e=>{if(e.key==='Enter'){state.selectedKey=row.dataset.select;renderAll()}}));
   }
   function renderReasons(){const list=shownStocks();$('content').innerHTML=`<p class="muted">공식 LOCK의 선정 당시 원문을 표시합니다. 후일의 주가·뉴스를 선정 이유에 소급 반영하지 않습니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${s.rank}. ${h(s.name)} ${s.top5?'<span class="status track">TOP5</span>':''}</b><p>${h(s.reason||'공식 선정 이유 기록 없음')}</p></button>`).join('')||'<div class="empty">선정 이유 자료가 없습니다.</div>'}`}
-  function renderTop5(){let list=shownStocks().filter(s=>s.top5);$('content').innerHTML=`<p class="muted">해당 DAY의 공식 TOP5. 이후 성과는 검증된 MASTER 결과가 있는 경우에만 표기합니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${h(s.rank)} · ${h(s.name)} (${h(s.code)}) ${statusBadge(s.record?resultType(s.record):'WAIT')}</b><p>${h(s.reason||'선정 이유 없음')}</p><p>MFE: ${h(pct(s.record?.['MFE %']))}　MAE: ${h(pct(s.record?.['MAE %']))}　최초 도달: ${h(s.record?.['First Hit D+']||'—')}</p></button>`).join('')||'<div class="empty">TOP5 기록이 없습니다.</div>'}`}
-  function renderDays(){let m=state.model;
+
+  function renderTop5(){const list=shownStocks().filter(s=>s.top5);
+    $('content').innerHTML=`<p class="muted">해당 DAY의 공식 TOP5 · 선정일 ${h(currentCohort()?.date)} · MASTER 기준일 ${h(state.model.pointer.as_of)}. 공식 D+1~D+5 추적과 D0 사후 관측을 구분합니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${h(s.rank)} · ${h(s.name)} (${h(s.code)}) ${performanceBadge(s)}</b><p>${h(s.reason||'선정 이유 없음')}</p><p>공식 D+1~D+5 MFE: ${h(pct(s.record?.['MFE %']))}　MAE: ${h(pct(s.record?.['MAE %']))}　최초 도달: ${h(s.record?.['First Hit D+']||'—')}</p>${observationHTML(s)}</button>`).join('')||'<div class="empty">TOP5 기록이 없습니다.</div>'}`;
+  }
+  function renderDays(){const m=state.model;
     const cards=[...m.cohorts].reverse().map(c=>{
-      const rs=c.stocks.map(x=>x.record).filter(Boolean);const seen=rs.filter(x=>resultType(x)==='SUCCESS').length;const f=rs.filter(x=>x.Status==='CLOSED'&&resultType(x)==='FAIL').length;const pending=c.stocks.filter(x=>!x.record).length;
-      return `<button class="day-card ${c.date===state.selectedCohort?'active':''}" type="button" data-cohort="${h(c.date)}"><small>${h(c.cohortId)}</small><b>${h(c.date)}</b><div class="positive">관측 성공 ${seen}종</div><div class="negative">확정 실패 ${f}종</div><small>성과 미반영 ${pending}종 · 선정 ${c.stocks.length}종</small></button>`;
+      const rs=c.stocks.map(x=>x.record).filter(Boolean),seen=rs.filter(x=>resultType(x)==='SUCCESS').length;
+      const fail=rs.filter(x=>x.Status==='CLOSED'&&resultType(x)==='FAIL').length,obs=c.stocks.filter(x=>x.observation).length;
+      return `<button class="day-card ${c.date===state.selectedCohort?'active':''}" type="button" data-cohort="${h(c.date)}"><small>${h(c.cohortId)}</small><b>${h(c.date)}</b><div class="positive">공식 추적 성공 ${seen}종</div><div class="negative">확정 실패 ${fail}종</div><small>D+1~D+5 자료 대기 ${c.stocks.length-rs.length}종 · 선정 ${c.stocks.length}종</small><p>D0 사후 관측 ${obs}종 · 공식 집계 제외</p></button>`;
     });
-    $('content').innerHTML=`<p class="muted">공식 코호트별 검증 현황. D+5 미종료의 TRACKING을 실패에 포함하지 않음. 새 기준과 LEGACY_REFERENCE 통계는 합산하지 않음.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px"><b>LEGACY_REFERENCE (별도 참고 통계)</b><p>기록 ${m.legacy.length}종 · 새 기준 헌터 성공률에 미포함</p><b>공식 NEW_20261008</b><p>기록 ${m.official.length}종 · MASTER ${h(m.pointer.as_of)} 기준</p></div>`;
+    $('content').innerHTML=`<p class="muted">MASTER 기준일 ${h(m.pointer.as_of)} · 공식 D+1~D+5 성과만 집계합니다. D0 기점 관측의 누적 수치로 실제 D+1~D+5 성과를 재계산하지 않습니다. TRACKING은 실패에 포함하지 않습니다.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px"><b>LEGACY_REFERENCE (별도 참고 통계)</b><p>기록 ${m.legacy.length}종 · 새 기준 성공률에 미포함</p><b>공식 D+1~D+5 · NEW_20261008</b><p>기록 ${m.official.length}종</p><b>D0 기점 사후 관측 — 공식 집계 제외</b><p>기록 ${m.observations.length}종</p></div>`;
   }
   function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>k?sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null):[];const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'미수집';
     const kinds=[['공식 종합점수',null],['LIGHT 순위 참고점수','light_rank_score'],['차트·기술 점수','chart_technical_score_100'],['모멘텀 점수','momentum_score_100'],['거래량 점수','volume_score_100'],['캔들 점수','candle_score_100'],['종가 위치','close_position_score_100'],['돌파 위치','breakout_position_score_100'],['세션 강도','session_strength_score_100']];
@@ -759,7 +831,7 @@
     const r=s.record;const prices=[];for(let i=1;i<=5;i++){const close=num(r?.[`D+${i} Close`]);const day=r?.[`D+${i} Date`];if(close!==null && day)prices.push({v:close,day})}
     const chart=prices.length?lineChart(prices):'<div class="empty" style="padding:35px 4px">검증된 D+1~D+5 일별 종가 없음<br>키움 WebSocket 실시간 차트는 이후 단계</div>';
     const reasons=String(s.reason||'선정 이유 미기록').split(/;\s*/).filter(Boolean);
-    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} 공식 LOCK ${s.top5?'· TOP5':''}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${prices.length?'MASTER D+1~D+5 검증 종가만 연결됨':'미관측 / 미검증 데이터는 표시하지 않음'}</div></div><div class="detail-h">3% Hunter 관측</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'MASTER 성과 미반영'}</li><li>기준 D+1 시초가: <strong>${h(money(r?.['Reference Open']))}</strong>　목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달일: <strong>${h(r?.['First Hit D+']||'—')}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')||'<li>선정 이유 미기록</li>'}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>종합점수: <strong>${h(scoreText(s,'total'))}</strong> · 공식 종합점수 원천 필드 없음</li><li>차트·기술: <strong>${h(scoreText(s,'chart'))}</strong> / 모멘텀: <strong>${h(scoreText(s,'momentum'))}</strong></li><li>LIGHT 순위 참고점수: <strong>${h(scoreText(s,'light'))}</strong></li><li>${h(scoreNote(s))}</li><li>원자료 없는 점수는 미수집 · 선정 이유의 점수 표현은 LOCK 원문 그대로 보존</li></div>`;
+    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} 공식 LOCK ${s.top5?'· TOP5':''}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${prices.length?'MASTER D+1~D+5 검증 종가만 연결됨':'미관측 / 미검증 데이터는 표시하지 않음'}</div></div>${observationHTML(s)}<div class="detail-h">공식 3% Hunter · D+1~D+5</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'공식 D+1~D+5 검증 자료 대기'}</li><li>기준 D+1 시초가: <strong>${h(money(r?.['Reference Open']))}</strong>　목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달일: <strong>${h(r?.['First Hit D+']||'—')}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')||'<li>선정 이유 미기록</li>'}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>종합점수: <strong>${h(scoreText(s,'total'))}</strong> · 공식 종합점수 원천 필드 없음</li><li>차트·기술: <strong>${h(scoreText(s,'chart'))}</strong> / 모멘텀: <strong>${h(scoreText(s,'momentum'))}</strong></li><li>LIGHT 순위 참고점수: <strong>${h(scoreText(s,'light'))}</strong></li><li>${h(scoreNote(s))}</li><li>원자료 없는 점수는 미수집 · 선정 이유의 점수 표현은 LOCK 원문 그대로 보존</li></div>`;
   }
   function lineChart(prices){
     const values=prices.map(p=>p.v);const lo=Math.min(...values),hi=Math.max(...values),span=Math.max(1,hi-lo);
@@ -768,6 +840,7 @@
     return `<svg viewBox="0 0 310 165" role="img" aria-label="검증 일별 종가 추세"><line x1="25" y1="30" x2="290" y2="30" stroke="#263b55"/><line x1="25" y1="84" x2="290" y2="84" stroke="#263b55"/><line x1="25" y1="137" x2="290" y2="137" stroke="#263b55"/><polyline points="${poly}" fill="none" stroke="#4897ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${xy.map(p=>`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#6cb4ff"/>`).join('')}<text x="20" y="17" fill="#8db2d7" font-size="10">${h(comma(hi))}</text><text x="20" y="155" fill="#8db2d7" font-size="10">${h(comma(lo))}</text></svg>`;
   }
   function renderAll(){
+    renderMasterStatus();
     renderScoreConnection();
     $('dashboardBody').hidden=!state.model;
     document.querySelectorAll('#tabs [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab));

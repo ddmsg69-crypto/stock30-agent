@@ -17,3 +17,11 @@
 @media(max-width:680px){.welcome-panel{margin:15px 4px;padding:29px 14px}.welcome-google{min-width:0;width:100%}}
 
 .dashboard-body[hidden]{display:none!important}
+
+
+.refresh-status{padding:12px 16px;margin-bottom:12px;overflow-wrap:anywhere}
+.refresh-status p{margin:4px 0;line-height:1.7}
+.observation-note{margin:12px 0;padding:12px;border:1px solid #735b36;border-radius:8px;background:#2b261c;font-size:12px;line-height:1.7;overflow-wrap:anywhere}
+.observation-note strong{color:#ffd28b}.observation-note p{margin:6px 0;color:#c8bca7}
+.d0-tag{display:block;margin-top:6px;color:#ffd28b;font-size:10px}
+@media(max-width:680px){.right-tools input{min-width:0;width:0}.day-card{min-width:0;overflow-wrap:anywhere}.workflow-head{flex-wrap:wrap;gap:6px}}
