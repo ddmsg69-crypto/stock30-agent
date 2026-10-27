@@ -125,15 +125,33 @@
     const embedded=result.master.locked_selections.find(c=>c.selection_date===ext?.selection_date);
     if(embedded && embedded.sha256!==ext.sha256)throw Error('MASTER와 기존 공식 LOCK 충돌');
     const files={...state.files,masterPointer:result.pointer,generation:result.generation};
+    // Validate the entire prospective model before changing the accepted MASTER.
     const candidate=previewModel(files,ids,session.documents);
+    rejectMasterLinkRegression(state.model,candidate);
     const changed=state.model?.pointer.generation!==candidate.pointer.generation;
     const previousLatest=state.model?.cohorts.at(-1)?.date||'';
-    scoreRequest++;state.files=files;state.fileIds=ids;state.mode=mode;state.masterRaw={pointer:pointerRaw,generation:generationRaw};
-    state.model=candidate;
-    if(candidate.cohorts.at(-1)?.date>previousLatest)state.selectedCohort=candidate.cohorts.at(-1).date;
-    state.masterCheckedAt=new Date().toISOString();if(changed)state.masterAcceptedAt=state.masterCheckedAt;
-    state.masterStatus=changed?'자동 갱신 PASS':'최신 정상본 확인';
-    assemble();rememberFiles();updateConnection();return true;
+    const previous={files:state.files,ids:state.fileIds,mode:state.mode,raw:state.masterRaw,
+      model:state.model,cohort:state.selectedCohort,key:state.selectedKey,
+      checkedAt:state.masterCheckedAt,acceptedAt:state.masterAcceptedAt,status:state.masterStatus};
+    try{
+      state.files=files;state.fileIds=ids;state.mode=mode;
+      state.masterRaw={pointer:pointerRaw,generation:generationRaw};state.model=candidate;
+      if(candidate.cohorts.at(-1)?.date>previousLatest)state.selectedCohort=candidate.cohorts.at(-1).date;
+      if(!candidate.cohorts.some(c=>c.date===state.selectedCohort))state.selectedCohort=candidate.cohorts.at(-1)?.date||'';
+      if(!findStock(state.selectedKey))state.selectedKey='';
+      state.masterCheckedAt=new Date().toISOString();if(changed)state.masterAcceptedAt=state.masterCheckedAt;
+      state.masterStatus=changed?'자동 갱신 PASS':'최신 정상본 확인';
+      $('workflowSection').classList.add('compact');$('toggleConnection').textContent='연결 관리 펼치기';$('settingsPanel').hidden=true;
+      renderAll();updateConnection();rememberFiles();scoreRequest++;return true;
+    }catch(error){
+      state.files=previous.files;state.fileIds=previous.ids;state.mode=previous.mode;
+      state.masterRaw=previous.raw;state.model=previous.model;
+      state.selectedCohort=previous.cohort;state.selectedKey=previous.key;
+      state.masterCheckedAt=previous.checkedAt;state.masterAcceptedAt=previous.acceptedAt;
+      state.masterStatus=previous.status;
+      try{renderAll();updateConnection()}catch(_){/* preserve the previous accepted model */}
+      throw error;
+    }
   }
   function updateConnection(){
     const connected=!!state.token && Date.now()<tokenExpiry;
@@ -642,6 +660,76 @@
     if($('useSnapshotModeBtn'))$('useSnapshotModeBtn').disabled=!state.token || state.scoreMode!=='fixed' || scoreSession.status==='확인 중';
   }
 
+  // DISPLAY ONLY: do not rewrite MASTER, LOCK, dates, hashes, or official classifications.
+  function masterLinkDate(value,context){
+    const date=String(value??'').trim();
+    if(!fixedDate(date))throw Error('MASTER 연결 날짜 오류: '+context);
+    return date;
+  }
+  function masterLinkCode(value,context){
+    const codeValue=String(value??'').trim();
+    if(!/^\d{1,6}$/.test(codeValue))throw Error('MASTER 연결 종목코드 오류: '+context);
+    return codeValue.padStart(6,'0');
+  }
+  function masterLinkCohort(value,date,context){
+    const raw=String(value??'').trim();
+    if(raw && raw!==date && raw!=='C_'+date)throw Error('MASTER 코호트 ID 불일치: '+context);
+    return 'C_'+date;
+  }
+  function validatedMasterLinks(db,locked,asOf){
+    const index=new Map(),cohortDates=new Set();
+    for(const r of db){
+      const date=masterLinkDate(r['Cohort Date'],'DB');
+      const stockCode=masterLinkCode(r['Stock Code'],date);
+      const canonical=masterLinkCohort(r.Cohort_ID,date,date+' / '+stockCode);
+      const key=date+'|'+stockCode;
+      if(index.has(key))throw Error('MASTER 연결 중복 기록: '+key);
+      r.__date=date;r.__code=stockCode;r.__canonicalCohort=canonical;
+      index.set(key,r);
+    }
+    for(const cohort of locked){
+      const date=masterLinkDate(cohort.selection_date,'LOCK');
+      // The signed official LOCK is authoritative: only MASTER-side IDs may fall back.
+      if(String(cohort.cohort_id??'').trim()!=='C_'+date)throw Error('공식 LOCK 코호트 ID 불일치: '+date);
+      if(cohortDates.has(date))throw Error('공식 LOCK 중복 코호트: '+date);
+      cohortDates.add(date);
+      if(!Array.isArray(cohort.stocks) || cohort.stocks.length!==30)throw Error('공식 LOCK 종목 수 불일치: '+date);
+      const codes=new Set();let connected=0;
+      for(const stock of cohort.stocks){
+        const id=masterLinkCode(stock.stock_code,'LOCK '+date),key=date+'|'+id;
+        if(codes.has(id))throw Error('공식 LOCK 종목 중복: '+key);
+        codes.add(id);
+        const record=index.get(key);
+        if(record){
+          if(!['OFFICIAL_NEW_BASELINE','LEGACY_REFERENCE'].includes(record.__dataClass))throw Error('MASTER 공식 성과 분류 불일치: '+key);
+          connected++;
+        }
+      }
+      // A newer LOCK can legitimately be PENDING before its first MASTER day.
+      // An existing/older official cohort cannot silently lose one or all rows.
+      if((connected>0 || date<asOf) && connected!==cohort.stocks.length){
+        throw Error(`MASTER↔LOCK 연결 누락: ${date} ${connected}/${cohort.stocks.length}`);
+      }
+    }
+    return index;
+  }
+  function rejectMasterLinkRegression(previous,candidate){
+    if(!previous)return;
+    const next=new Map(candidate.cohorts.map(c=>[c.date,c]));
+    for(const cohort of previous.cohorts){
+      const target=next.get(cohort.date);
+      if(!target)throw Error('MASTER 갱신에서 기존 공식 코호트 누락: '+cohort.date);
+      const stocks=new Map(target.stocks.map(s=>[s.code,s]));
+      for(const old of cohort.stocks){
+        const now=stocks.get(old.code);
+        if(!now)throw Error('MASTER 갱신에서 기존 LOCK 종목 누락: '+cohort.date+'|'+old.code);
+        if(old.record && (!now.record || old.record.__dataClass!==now.record.__dataClass)){
+          throw Error('MASTER 갱신에서 기존 성과 연결 감소: '+cohort.date+'|'+old.code);
+        }
+      }
+    }
+  }
+
   function assemble(render=true){
     const p=state.files.masterPointer,g=state.files.generation;
     if(!p||!g){state.model=null;if(render)renderAll();return}
@@ -671,9 +759,9 @@
     if(ext){const i=locked.findIndex(x=>x.selection_date===ext.selection_date);if(i>=0)locked[i]=ext;else locked.push(ext)}
     locked.sort((a,b)=>String(a.selection_date).localeCompare(String(b.selection_date)));
     const scores=scoreIndex(scoreDocuments(),registered);
-    const masterByKey=new Map(db.map(r=>[(r.Cohort_ID||r.__date)+'|'+r.__code,r]));
+    const masterByKey=validatedMasterLinks(db,locked,p.as_of);
     const cohorts=locked.map(c=>({date:c.selection_date,cohortId:c.cohort_id,stocks:(c.stocks||[]).map(s=>{
-      const rawRecord=masterByKey.get(c.cohort_id+'|'+code(s.stock_code));
+      const rawRecord=masterByKey.get(masterLinkDate(c.selection_date,'LOCK')+'|'+masterLinkCode(s.stock_code,'LOCK'));
       const observation=isD0Observation(rawRecord)?rawRecord:null;
       const record=rawRecord && ['OFFICIAL_NEW_BASELINE','LEGACY_REFERENCE'].includes(rawRecord.__dataClass)?rawRecord:null;
       const candidate=scores.get(scoreKey(c.selection_date,c.cohort_id,s.stock_code));
