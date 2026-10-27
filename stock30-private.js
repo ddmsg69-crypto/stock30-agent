@@ -9,7 +9,7 @@
   const money = x => num(x)===null?'—':comma(x)+'원';
   const pct = x => num(x)===null?'—':`${num(x)>=0?'+':''}${num(x).toFixed(2)}%`;
   const code = x => String(x ?? '').trim().replace(/^\D?(\d+)$/,(_,d)=>d.padStart(6,'0'));
-  const statusText = {SUCCESS:'SUCCESS',FAIL:'FAIL',TRACKING:'추적중',PENDING:'D+1 대기',WAIT:'확인 대기'};
+  const statusText = {SUCCESS:'SUCCESS',FAIL:'FAIL',TRACKING:'추적중',PENDING:'가격·성과 대기',WAIT:'확인 대기'};
   const fmtDay = x => typeof x==='string' && /^\d{4}-\d{2}-\d{2}$/.test(x)?x:'—';
   const k = (obj,key) => obj && Object.prototype.hasOwnProperty.call(obj,key) ? obj[key] : undefined;
   const EMPTY = Object.freeze({masterPointer:null,generation:null,lock:null,scoreSnapshot:null});
@@ -657,11 +657,12 @@
     if(master.as_of!==p.as_of)throw Error('MASTER 포인터 as_of와 generation 본문 날짜가 불일치합니다.');
     if(!Array.isArray(master.database)||master.database.length!==p.record_count)throw Error('MASTER DB 건수가 검증된 포인터 건수와 다릅니다.');
     const db=master.database.map(r=>{
-      const date=String(r['Cohort Date']||'');const id=code(r['Stock Code']);const c=master.data_classification?.[r.Record_ID]||master.data_classification?.[date+'|'+id]||'UNKNOWN';
-      return {...r,__date:date,__code:id,__dataClass:c};
+      const date=String(r['Cohort Date']||'');const id=code(r['Stock Code']);const meta=master.record_metadata?.[r.Record_ID]||{};
+      const c=master.data_classification?.[r.Record_ID]??master.data_classification?.[date+'|'+id]??meta.DATA_CLASS??r.DATA_CLASS??'UNKNOWN';
+      return {...r,__date:date,__code:id,__dataClass:c,__hunter:hunterPolicy(r,date,meta)};
     });
-    const official=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE' && !isD0Observation(r));
-    const observations=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE' && isD0Observation(r));
+    const official=db.filter(r=>r.__dataClass==='OFFICIAL_NEW_BASELINE');
+    const observations=db.filter(isD0Observation);
     const legacy=db.filter(r=>r.__dataClass==='LEGACY_REFERENCE');
     const registered=Array.isArray(master.locked_selections)?master.locked_selections:[];
     const ext=state.files.lock;
@@ -670,11 +671,11 @@
     if(ext){const i=locked.findIndex(x=>x.selection_date===ext.selection_date);if(i>=0)locked[i]=ext;else locked.push(ext)}
     locked.sort((a,b)=>String(a.selection_date).localeCompare(String(b.selection_date)));
     const scores=scoreIndex(scoreDocuments(),registered);
-    const masterByKey=new Map(db.map(r=>[r.__date+'|'+r.__code,r]));
+    const masterByKey=new Map(db.map(r=>[(r.Cohort_ID||r.__date)+'|'+r.__code,r]));
     const cohorts=locked.map(c=>({date:c.selection_date,cohortId:c.cohort_id,stocks:(c.stocks||[]).map(s=>{
-      const rawRecord=masterByKey.get(c.selection_date+'|'+code(s.stock_code));
+      const rawRecord=masterByKey.get(c.cohort_id+'|'+code(s.stock_code));
       const observation=isD0Observation(rawRecord)?rawRecord:null;
-      const record=observation?null:rawRecord;
+      const record=rawRecord && ['OFFICIAL_NEW_BASELINE','LEGACY_REFERENCE'].includes(rawRecord.__dataClass)?rawRecord:null;
       const candidate=scores.get(scoreKey(c.selection_date,c.cohort_id,s.stock_code));
       const scoreIssue=scoreMismatch(candidate,c,s);
       const score=scoreIssue?null:candidate;
@@ -692,15 +693,54 @@
   function findStock(key){if(!key)return null;return currentStocks().find(x=>x.date+'|'+x.code===key)||null}
   function chosen(){return findStock(state.selectedKey)||currentStocks()[0]||null}
   function resultType(r){const s=String(r?.['Final Result']||'PENDING').toUpperCase();return ['SUCCESS','FAIL','TRACKING','PENDING'].includes(s)?s:'PENDING'}
-  function isD0Observation(r){
-    return !!r && (r.Hunter_Day_Origin===0 || r.Hunter_Day_Origin==='0' || r.performance_policy==='REVIEW_D0_D4' ||
-      (r['D+1 Date'] && r['D+1 Date']<=r['Cohort Date']) || (r['Reference Date'] && r['Reference Date']<=r['Cohort Date']));
+  const HUNTER_CHANGE_DATE='2026-10-20';
+  const HUNTER_WINDOWS={D0:'D0~D+4',D1:'D+1~D+5',UNKNOWN:'정책 확인 필요'};
+  function hunterPolicy(r,date=r?.['Cohort Date'],meta={}){
+    const validDate=typeof date==='string' && /^\d{4}-\d{2}-\d{2}$/.test(date);
+    const explicit=num(r?.Hunter_Day_Origin??meta.Hunter_Day_Origin);
+    const tag=String(r?.performance_policy??meta.performance_policy??r?.Hunter_Policy??'');
+    const tagged=/D0|DPLUS4|D4/.test(tag)?0:/DPLUS1|D1_D5|AFTER_LOCK_SESSION_OPEN/.test(tag)?1:null;
+    const expected=validDate?(date>=HUNTER_CHANGE_DATE?0:1):null;
+    const origin=explicit??tagged??expected;
+    const conflict=(explicit!==null && ![0,1].includes(explicit)) || (explicit!==null && tagged!==null && explicit!==tagged) || (origin!==null && expected!==null && origin!==expected);
+    const key=conflict || origin===null?'UNKNOWN':origin===0?'D0':'D1';
+    return {key,origin:key==='UNKNOWN'?null:origin,label:HUNTER_WINDOWS[key],source:explicit!==null?'Hunter_Day_Origin':tagged!==null?'record policy':'selection-date policy transition',issue:conflict?'선정일 정책과 원본 메타데이터 불일치 · 원본 성과 보존':key==='UNKNOWN'?'정책 근거 부족 · 원본 성과 보존':''};
   }
-  function performanceBadge(s){return s.record?statusBadge(resultType(s.record)):statusBadge(s.observation?'PENDING':'WAIT')}
+  function stockPolicy(s){return s.record?.__hunter||s.observation?.__hunter||hunterPolicy(null,s.date)}
+  function cohortPolicy(c){
+    const keys=new Set((c?.stocks||[]).map(s=>stockPolicy(s).key));
+    return keys.size===1?HUNTER_WINDOWS[[...keys][0]]:keys.size?'정책 혼재 · 확인 필요':HUNTER_WINDOWS.UNKNOWN;
+  }
+  function hunterSessions(r,p=r?.__hunter||hunterPolicy(r)){
+    if(!r || p.origin===null)return [];
+    // Older column names are storage slots, not the logical Hunter day.
+    const explicitD0=p.origin===0 && /^\d{4}-\d{2}-\d{2}$/.test(r['D0 Date']||'');
+    return Array.from({length:5},(_,i)=>{
+      const day=p.origin+i,slot=explicitD0?(i===0?'D0':`D+${i}`):`D+${i+1}`;
+      return {day,label:day===0?'D0':`D+${day}`,date:r[`${slot} Date`],close:num(r[`${slot} Close`]),slot};
+    });
+  }
+  function hitLabel(r){
+    if(!r)return '—';
+    const p=r.__hunter||hunterPolicy(r),raw=r['First Hit D+'],value=num(raw),date=r['First Hit Date'];
+    const session=hunterSessions(r,p).find(x=>x.date && x.date===date);
+    const day=value??session?.day;
+    const label=day===0?'D0':day!==null && day!==undefined?`D+${day}`:raw??'—';
+    return `${label}${date?' · '+date:''}${session && value!==null && session.day!==value?' · 원본 도달일/차수 불일치':''}`;
+  }
+  function policyRates(rows){return ['D1','D0','UNKNOWN'].map(key=>({key,label:HUNTER_WINDOWS[key],rows:rows.filter(r=>r.__hunter.key===key)}))}
+  function rateLabel(rows){const r=finalRate(rows);return `${r.rate===null?'미확정':r.rate.toFixed(1)+'%'} (${r.win}/${r.total})`}
+  function isD0Observation(r){
+    // Origin0 and a retrospective caveat do not override authoritative official classification.
+    if(!r || ['OFFICIAL_NEW_BASELINE','LEGACY_REFERENCE'].includes(r.__dataClass))return false;
+    return r.performance_policy==='REVIEW_D0_D4' || num(r.Hunter_Day_Origin)===0;
+  }
+  function performanceBadge(s){return statusBadge(s.record?resultType(s.record):s.observation?'PENDING':'WAIT')}
   function observationHTML(s){
-    const r=s.observation;if(!r)return '';
-    const dates=Array.from({length:5},(_,i)=>r[`D+${i+1} Date`]?`D${i===0?'0':'+'+i} ${r[`D+${i+1} Date`]}`:'').filter(Boolean).join(' · ');
-    return `<div class="observation-note"><strong>D0 기점 사후 관측 · 공식 D+1~D+5 집계 제외</strong><p>선정일 전체 세션의 사후 관측이며 선정 이후 달성 가능한 수익률이 아닙니다. 공식 추적 성과는 별도 검증 자료 대기입니다.</p><p>${h(dates)} · 원자료 판정 ${h(resultType(r))} · MFE ${h(pct(r['MFE %']))} · MAE ${h(pct(r['MAE %']))} · 기준일 ${h(r['Data As Of']||state.model?.pointer.as_of)}</p></div>`;
+    const r=s.record||s.observation,p=stockPolicy(s);if(!r)return '';
+    if(p.issue)return `<div class="observation-note"><strong>${h(p.issue)}</strong><p>정책별 통계와 날짜 라벨을 확인해야 합니다. 원본 판정 ${h(resultType(r))}, 최초도달 ${h(hitLabel(r))}, MFE ${h(pct(r['MFE %']))}, MAE ${h(pct(r['MAE %']))}는 수정하지 않습니다.</p></div>`;
+    if(p.key!=='D0')return '';
+    return `<div class="observation-note"><strong>${s.record?'공식 D0~D+4 성과 · 원본 유지':'비공식 D0 관측 · 공식 집계 제외'}</strong><p>D0 SOR FINAL 시초가 기준. 선정일 고가는 선정 이전 구간을 포함할 수 있는 연구상 후행 관측이며 선정 이후 실현 가능한 수익률이 아닙니다. 이 한계로 공식 성과를 제외하거나 PENDING으로 바꾸지 않습니다. SUCCESS 후에도 D+4까지 MFE·MAE를 추적합니다.</p></div>`;
   }
   // Only fields whose meaning was verified in the selection-time score snapshot.
   // No official composite score is present in the investigated sources.
@@ -764,18 +804,18 @@
     const m=state.model;
     const stat=(title,value,desc,icon,vals)=>`<article class="card kpi"><div class="kpi-name"><em>${icon}</em>${h(title)}</div><div class="kpi-value">${h(value)}</div><div class="kpi-sub">${h(desc)}</div>${vals?.length?'<div class="kpi-graph">'+vals.map(v=>`<i data-bar="${Math.max(5,Math.min(100,Number(v)||0))}"></i>`).join('')+'</div>':''}</article>`;
     if(!m){$('summary').innerHTML=[stat('Hunter 확정 성공률','—','공식 검증 MASTER 필요','◎'),stat('종합점수','미수집','공식 종합점수 원천 필드 없음','♜'),stat('DAY별 성공현황','—','검증된 코호트 기록 없음','▥'),stat('ACTIVE 코호트','—','Drive 연결 대기','♧'),stat('TOP5 평균 MFE','—','관측값 없음','↗'),stat('TOP5 평균 MAE','—','관측값 없음','↘'),stat('운영 체크포인트','08:30','15:40 · 16:20 / 주문 0건','▤')].join('');setBars();return}
-    const r=finalRate(m.official);const dayCounts=m.cohorts.map(c=>c.stocks.filter(s=>s.record && resultType(s.record)==='SUCCESS').length);
+    const partitions=policyRates(m.official);const dayCounts=m.cohorts.map(c=>c.stocks.filter(s=>s.record && resultType(s.record)==='SUCCESS').length);
     const activeDates=new Set(m.official.filter(x=>x.Status==='ACTIVE').map(r=>r.__date));
     const top=m.official.filter(r=>String(r.TOP5)==='True'||r.TOP5===true||String(r.TOP5)==='1');
     const mfe=top.map(x=>num(x['MFE %'])).filter(x=>x!==null);const mae=top.map(x=>num(x['MAE %'])).filter(x=>x!==null);
     const avg=arr=>arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:null;
     $('summary').innerHTML=[
-      stat('Hunter 확정 성공률',r.rate===null?'미확정':r.rate.toFixed(1)+'%',`D+1~D+5 종료 ${r.total}종 · 성공 ${r.win}종 · D0 제외`,'◎'),
+      stat('Hunter 확정 성공률','정책별',partitions.filter(p=>p.rows.length).map(p=>`${p.label} ${rateLabel(p.rows)}`).join(' · ')+' · CLOSED만 분모','◎'),
       stat('종합점수','미수집','공식 종합점수 원천 필드 없음 · LIGHT와 구분','♜'),
       stat('DAY별 성공현황',`${m.cohorts.length} DAY`,`실제 관측 성공 ${m.official.filter(x=>resultType(x)==='SUCCESS').length}종 · 확정과 구분`,'▥',dayCounts.map(x=>x/30*100)),
-      stat('ACTIVE 코호트',String(activeDates.size),`공식 추적 ${m.official.length}종 · D0 사후 관측 ${m.observations.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
-      stat('TOP5 평균 MFE',avg(mfe)===null?'—':pct(avg(mfe)),`새 기준 관측 종목 ${mfe.length}개 · 최종수익률 아님`,'↗'),
-      stat('TOP5 평균 MAE',avg(mae)===null?'—':pct(avg(mae)),`새 기준 관측 종목 ${mae.length}개`,'↘'),
+      stat('ACTIVE 코호트',String(activeDates.size),`공식 추적 ${m.official.length}종 · 별도 비공식 관측 ${m.observations.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
+      stat('TOP5 평균 MFE','정책별',partitions.filter(p=>p.rows.length).map(p=>{const a=p.rows.filter(r=>top.includes(r)).map(r=>num(r['MFE %'])).filter(x=>x!==null);return `${p.label} ${pct(avg(a))} (${a.length}종)`}).join(' · ')+' · 최종수익률 아님','↗'),
+      stat('TOP5 평균 MAE','정책별',partitions.filter(p=>p.rows.length).map(p=>{const a=p.rows.filter(r=>top.includes(r)).map(r=>num(r['MAE %'])).filter(x=>x!==null);return `${p.label} ${pct(avg(a))} (${a.length}종)`}).join(' · '),'↘'),
       stat('운영 체크포인트',fmtDay(m.pointer.as_of),`MASTER ${m.db.length}건 · ${m.pointer.validation_status} · 정규 15:40`,'▤')
     ].join('');setBars();
   }
@@ -807,39 +847,41 @@
     if(state.tab==='learning')return renderLearning();
   }
   function renderStocks(){const list=shownStocks();$('content').innerHTML=`<div class="data-wrap"><table class="stock-table"><thead><tr><th>순위</th><th>종목명 · 코드</th><th>검증 종가</th><th>+3% 목표</th><th>Hunter</th><th>종합점수</th><th>차트·기술</th><th>모멘텀</th><th>LIGHT 점수</th><th>MFE</th><th>MAE</th><th>코호트</th></tr></thead><tbody>${list.map(s=>{
-    const r=s.record;const re=r?resultType(r):'WAIT';return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${performanceBadge(s)}${s.observation?'<small class="d0-tag">D0 사후 관측 별도</small>':''}</td>${['total','chart','momentum','light'].map(kind=>`<td class="score" title="${h(kind==='total'?'공식 종합점수 원천 필드 없음':scoreNote(s))}">${h(scoreText(s,kind))}</td>`).join('')}<td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="12" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">MASTER 기준일: ${h(state.model.pointer.as_of)} · 선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div><p class="muted">D0 사후 관측은 종목 상세에서 별도 표시하며 공식 추적 값과 합산하지 않습니다. 점수는 별도 LEARNING_SCORE_SNAPSHOT JSON을 보조 데이터에서 선택하면 연결됩니다. 선정일·코호트·종목코드와 LOCK 참조팩이 일치하는 값만 표시합니다. 종합점수는 미수집이며 LIGHT는 순위 참고점수입니다.</p>`;
+    const r=s.record;const re=r?resultType(r):'WAIT';return `<tr tabindex="0" data-select="${h(stockKey(s))}" class="${chosen()&&stockKey(chosen())===stockKey(s)?'selected':''}"><td>${h(s.rank)}</td><td><span class="stock-name">${h(s.name)}</span><span class="stock-code">${h(s.code)}${s.top5?' · TOP5':''}</span></td><td>${h(money(r?.Close))}</td><td>${h(money(r?.['+3% Target']))}</td><td>${performanceBadge(s)}${s.observation?'<small class="d0-tag">D0 사후 관측 별도</small>':''}</td>${['total','chart','momentum','light'].map(kind=>`<td class="score" title="${h(kind==='total'?'공식 종합점수 원천 필드 없음':scoreNote(s))}">${h(scoreText(s,kind))}</td>`).join('')}<td class="positive">${h(pct(r?.['MFE %']))}</td><td class="negative">${h(pct(r?.['MAE %']))}</td><td>${h(s.date.slice(5))}</td></tr>`}).join('')||`<tr><td colspan="12" class="empty">조건에 맞는 종목이 없습니다.</td></tr>`}</tbody></table></div><div class="table-foot">MASTER 기준일: ${h(state.model.pointer.as_of)} · 선정일: ${h(fmtDay(currentCohort()?.date))} · 표시 ${list.length}종 · 가격은 실시간이 아닌 MASTER 마지막 검증값 · 종목 선택 시 오른쪽 상세 갱신</div><p class="muted">공식 성과는 코호트별 정책을 따릅니다. D0~D+4의 후행성 경고는 공식 판정을 취소하지 않습니다. 비공식 관측·LEGACY는 별도 구분합니다. 점수는 별도 LEARNING_SCORE_SNAPSHOT JSON을 보조 데이터에서 선택하면 연결됩니다. 선정일·코호트·종목코드와 LOCK 참조팩이 일치하는 값만 표시합니다. 종합점수는 미수집이며 LIGHT는 순위 참고점수입니다.</p>`;
     document.querySelectorAll('tr[data-select]').forEach(row=>row.addEventListener('keydown',e=>{if(e.key==='Enter'){state.selectedKey=row.dataset.select;renderAll()}}));
   }
   function renderReasons(){const list=shownStocks();$('content').innerHTML=`<p class="muted">공식 LOCK의 선정 당시 원문을 표시합니다. 후일의 주가·뉴스를 선정 이유에 소급 반영하지 않습니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${s.rank}. ${h(s.name)} ${s.top5?'<span class="status track">TOP5</span>':''}</b><p>${h(s.reason||'공식 선정 이유 기록 없음')}</p></button>`).join('')||'<div class="empty">선정 이유 자료가 없습니다.</div>'}`}
 
   function renderTop5(){const list=shownStocks().filter(s=>s.top5);
-    $('content').innerHTML=`<p class="muted">해당 DAY의 공식 TOP5 · 선정일 ${h(currentCohort()?.date)} · MASTER 기준일 ${h(state.model.pointer.as_of)}. 공식 D+1~D+5 추적과 D0 사후 관측을 구분합니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${h(s.rank)} · ${h(s.name)} (${h(s.code)}) ${performanceBadge(s)}</b><p>${h(s.reason||'선정 이유 없음')}</p><p>공식 D+1~D+5 MFE: ${h(pct(s.record?.['MFE %']))}　MAE: ${h(pct(s.record?.['MAE %']))}　최초 도달: ${h(s.record?.['First Hit D+']||'—')}</p>${observationHTML(s)}</button>`).join('')||'<div class="empty">TOP5 기록이 없습니다.</div>'}`;
+    $('content').innerHTML=`<p class="muted">해당 DAY TOP5 · 선정일 ${h(currentCohort()?.date)} · ${h(cohortPolicy(currentCohort()))} · MASTER ${h(state.model.pointer.as_of)}. 정책별 원본 성과를 보존합니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${h(s.rank)} · ${h(s.name)} (${h(s.code)}) ${performanceBadge(s)}</b><p>${h(s.reason||'선정 이유 없음')}</p><p>${h(stockPolicy(s).label)} MFE: ${h(pct(s.record?.['MFE %']))}　MAE: ${h(pct(s.record?.['MAE %']))}　최초 도달: ${h(hitLabel(s.record))}</p>${observationHTML(s)}</button>`).join('')||'<div class="empty">TOP5 기록이 없습니다.</div>'}`;
   }
   function renderDays(){const m=state.model;
     const cards=[...m.cohorts].reverse().map(c=>{
-      const rs=c.stocks.map(x=>x.record).filter(Boolean),seen=rs.filter(x=>resultType(x)==='SUCCESS').length;
-      const fail=rs.filter(x=>x.Status==='CLOSED'&&resultType(x)==='FAIL').length,obs=c.stocks.filter(x=>x.observation).length;
-      return `<button class="day-card ${c.date===state.selectedCohort?'active':''}" type="button" data-cohort="${h(c.date)}"><small>${h(c.cohortId)}</small><b>${h(c.date)}</b><div class="positive">공식 추적 성공 ${seen}종</div><div class="negative">확정 실패 ${fail}종</div><small>D+1~D+5 자료 대기 ${c.stocks.length-rs.length}종 · 선정 ${c.stocks.length}종</small><p>D0 사후 관측 ${obs}종 · 공식 집계 제외</p></button>`;
+      const rs=c.stocks.map(x=>x.record).filter(r=>r?.__dataClass==='OFFICIAL_NEW_BASELINE'),seen=rs.filter(x=>resultType(x)==='SUCCESS').length;
+      const fail=rs.filter(x=>String(x.Status).toUpperCase()==='CLOSED'&&resultType(x)==='FAIL').length,tracking=rs.filter(x=>resultType(x)==='TRACKING').length;
+      const rate=finalRate(rs),obs=c.stocks.filter(x=>x.observation).length;
+      return `<button class="day-card ${c.date===state.selectedCohort?'active':''}" type="button" data-cohort="${h(c.date)}"><small>${h(c.cohortId)} · ${h(cohortPolicy(c))}</small><b>${h(c.date)}</b><div class="positive">공식 SUCCESS ${seen}종</div><div class="negative">확정 FAIL ${fail}종</div><p>TRACKING ${tracking}종 · 종료 성공률 ${rate.rate===null?'미확정':rate.rate.toFixed(1)+'%'} (${rate.win}/${rate.total})</p><small>공식 검증 ${rs.length}/${c.stocks.length}종 · 미검증/참고 ${c.stocks.length-rs.length}종</small><p>비공식 관측 ${obs}종 · 별도 구분</p></button>`;
     });
-    $('content').innerHTML=`<p class="muted">MASTER 기준일 ${h(m.pointer.as_of)} · 공식 D+1~D+5 성과만 집계합니다. D0 기점 관측의 누적 수치로 실제 D+1~D+5 성과를 재계산하지 않습니다. TRACKING은 실패에 포함하지 않습니다.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px"><b>LEGACY_REFERENCE (별도 참고 통계)</b><p>기록 ${m.legacy.length}종 · 새 기준 성공률에 미포함</p><b>공식 D+1~D+5 · NEW_20261008</b><p>기록 ${m.official.length}종</p><b>D0 기점 사후 관측 — 공식 집계 제외</b><p>기록 ${m.observations.length}종</p></div>`;
+    $('content').innerHTML=`<p class="muted">MASTER ${h(m.pointer.as_of)} · 10/19까지 D+1~D+5, 10/20부터 D0~D+4. 정책별로 분리 집계하며 TRACKING은 FAIL로 바꾸지 않습니다. D0는 선정 이전 고가를 포함할 수 있으나 공식 분류 성과는 유지합니다.</p><div class="day-grid">${cards.join('')}</div><div class="reason-card" style="cursor:default;margin-top:18px">${policyRates(m.official).map(p=>`<b>공식 ${h(p.label)}</b><p>기록 ${p.rows.length}종 · 종료 성공률 ${h(rateLabel(p.rows))}</p>`).join('')}<b>LEGACY_REFERENCE</b><p>별도 참고 ${m.legacy.length}종 · 공식 성공률 제외</p><b>비공식 D0 관측</b><p>별도 ${m.observations.length}종 · 공식 성공률 제외</p></div>`;
   }
   function renderLearning(){const m=state.model;const sc=currentStocks().filter(x=>x.score);const vals=k=>k?sc.map(s=>knownScore(s.score,k)).filter(n=>n!==null):[];const avg=a=>a.length?(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1):'미수집';
     const kinds=[['공식 종합점수',null],['LIGHT 순위 참고점수','light_rank_score'],['차트·기술 점수','chart_technical_score_100'],['모멘텀 점수','momentum_score_100'],['거래량 점수','volume_score_100'],['캔들 점수','candle_score_100'],['종가 위치','close_position_score_100'],['돌파 위치','breakout_position_score_100'],['세션 강도','session_strength_score_100']];
     $('content').innerHTML=`<p class="muted">선정 시점 점수만 표시합니다. 점수 스냅샷을 선택하지 않았거나 원자료에 없는 항목은 0으로 채우지 않습니다.</p><div class="learning-grid">${kinds.map(([label,key])=>`<article class="learning-card"><h3>${h(label)}</h3><strong>${h(avg(vals(key)))}</strong><p>데이터 ${vals(key).length}/${currentStocks().length}종 · 선정 당시 원자료 기준</p></article>`).join('')}</div><div class="reason-card" style="cursor:default;margin-top:15px"><b>원천에 없는 점수 항목</b><p>독립 추세 · 패턴 · 타이밍 · 수급 · 뉴스 점수는 원자료에 없다면 미수집으로 표시. 기존 점수 산식·가중치를 임의 변경하지 않음.</p></div>`;
   }
   function renderDetail(){const s=chosen();if(!s){$('detail').innerHTML='<h2>종목 상세</h2><p class="muted">검증된 MASTER 데이터와 공식 30종이 연결되면 차트·선정 이유를 표시합니다.</p>';return}
-    const r=s.record;const prices=[];for(let i=1;i<=5;i++){const close=num(r?.[`D+${i} Close`]);const day=r?.[`D+${i} Date`];if(close!==null && day)prices.push({v:close,day})}
-    const chart=prices.length?lineChart(prices):'<div class="empty" style="padding:35px 4px">검증된 D+1~D+5 일별 종가 없음<br>키움 WebSocket 실시간 차트는 이후 단계</div>';
+    const r=s.record,p=stockPolicy(s);const prices=hunterSessions(r,p).filter(x=>x.close!==null && x.date).map(x=>({v:x.close,day:x.date,label:x.label}));
+    const chart=prices.length?lineChart(prices):`<div class="empty" style="padding:35px 4px">${h(p.label)} 검증 일별 종가 없음<br>실시간 시세 미연결</div>`;
     const reasons=String(s.reason||'선정 이유 미기록').split(/;\s*/).filter(Boolean);
-    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} 공식 LOCK ${s.top5?'· TOP5':''}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${prices.length?'MASTER D+1~D+5 검증 종가만 연결됨':'미관측 / 미검증 데이터는 표시하지 않음'}</div></div>${observationHTML(s)}<div class="detail-h">공식 3% Hunter · D+1~D+5</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'공식 D+1~D+5 검증 자료 대기'}</li><li>기준 D+1 시초가: <strong>${h(money(r?.['Reference Open']))}</strong>　목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달일: <strong>${h(r?.['First Hit D+']||'—')}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')||'<li>선정 이유 미기록</li>'}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>종합점수: <strong>${h(scoreText(s,'total'))}</strong> · 공식 종합점수 원천 필드 없음</li><li>차트·기술: <strong>${h(scoreText(s,'chart'))}</strong> / 모멘텀: <strong>${h(scoreText(s,'momentum'))}</strong></li><li>LIGHT 순위 참고점수: <strong>${h(scoreText(s,'light'))}</strong></li><li>${h(scoreNote(s))}</li><li>원자료 없는 점수는 미수집 · 선정 이유의 점수 표현은 LOCK 원문 그대로 보존</li></div>`;
+    $('detail').innerHTML=`<h2>${h(s.name)}</h2><div class="sub">${h(s.code)} · ${h(s.date)} LOCK ${s.top5?'· TOP5':''} · ${h(r?.__dataClass||'미검증')}</div><div class="detail-price">${h(money(r?.Close))}</div><small>마지막 검증 종가 · 실시간 시세 아님</small><div class="chartbox">${chart}<div class="chart-note">${h(p.label)} · 원본 세션 날짜·종가 표시 (저장 열 이름과 정책 일차를 구분)</div></div>${observationHTML(s)}<div class="detail-h">3% Hunter · ${h(p.label)}</div><div class="reason-list"><li>판정: ${r?statusBadge(resultType(r)):'검증 자료 대기'}</li><li>기준 ${p.key==='D0'?'D0 SOR FINAL':p.key==='D1'?'D+1':'원본'} 시초가: <strong>${h(money(r?.['Reference Open']))}</strong> · 기준일 ${h(r?.['Reference Date']||'—')} · 목표: <strong>${h(money(r?.['+3% Target']))}</strong></li><li>MFE <strong class="positive">${h(pct(r?.['MFE %']))}</strong> · MAE <strong class="negative">${h(pct(r?.['MAE %']))}</strong></li><li>최초 +3% 도달: <strong>${h(hitLabel(r))}</strong></li></div><div class="detail-h">왜 선정했을까?</div><ol class="reason-list">${reasons.map((x,i)=>`<li><strong>${i+1}.</strong> ${h(x)}</li>`).join('')}</ol><div class="detail-h">선정시점 점수</div><div class="reason-list"><li>종합점수: <strong>${h(scoreText(s,'total'))}</strong> · 공식 종합점수 원천 필드 없음</li><li>차트·기술: <strong>${h(scoreText(s,'chart'))}</strong> / 모멘텀: <strong>${h(scoreText(s,'momentum'))}</strong></li><li>LIGHT 순위 참고점수: <strong>${h(scoreText(s,'light'))}</strong></li><li>${h(scoreNote(s))}</li><li>원자료 없는 점수는 미수집 · LOCK 원문 보존</li></div>`;
   }
   function lineChart(prices){
     const values=prices.map(p=>p.v);const lo=Math.min(...values),hi=Math.max(...values),span=Math.max(1,hi-lo);
-    const xy=prices.map((p,i)=>({x:30+i*(250/Math.max(1,prices.length-1)),y:132-(p.v-lo)/span*95,day:p.day,v:p.v}));
+    const xy=prices.map((p,i)=>({x:30+i*(250/Math.max(1,prices.length-1)),y:132-(p.v-lo)/span*95,day:p.day,label:p.label,v:p.v}));
     const poly=xy.map(p=>`${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-    return `<svg viewBox="0 0 310 165" role="img" aria-label="검증 일별 종가 추세"><line x1="25" y1="30" x2="290" y2="30" stroke="#263b55"/><line x1="25" y1="84" x2="290" y2="84" stroke="#263b55"/><line x1="25" y1="137" x2="290" y2="137" stroke="#263b55"/><polyline points="${poly}" fill="none" stroke="#4897ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${xy.map(p=>`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#6cb4ff"/>`).join('')}<text x="20" y="17" fill="#8db2d7" font-size="10">${h(comma(hi))}</text><text x="20" y="155" fill="#8db2d7" font-size="10">${h(comma(lo))}</text></svg>`;
+    return `<svg viewBox="0 0 310 165" role="img" aria-label="검증 일별 종가 추세"><line x1="25" y1="30" x2="290" y2="30" stroke="#263b55"/><line x1="25" y1="84" x2="290" y2="84" stroke="#263b55"/><line x1="25" y1="137" x2="290" y2="137" stroke="#263b55"/><polyline points="${poly}" fill="none" stroke="#4897ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${xy.map(p=>`<text x="${p.x.toFixed(1)}" y="164" text-anchor="middle" fill="#8db2d7" font-size="8">${h(p.label)} ${h(p.day.slice(5))}</text><circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#6cb4ff"><title>${h(p.label)} ${h(p.day)} · ${h(money(p.v))}</title></circle>`).join('')}<text x="20" y="17" fill="#8db2d7" font-size="10">${h(comma(hi))}</text><text x="20" y="155" fill="#8db2d7" font-size="10">${h(comma(lo))}</text></svg>`;
   }
   function renderAll(){
+    if($('hunterPolicyLabel'))$('hunterPolicyLabel').textContent=currentCohort()?`표시 코호트 ${currentCohort().date} · ${cohortPolicy(currentCohort())}`:'Hunter:10/19까지 D+1~D+5 · 10/20부터 D0~D+4';
     renderMasterStatus();
     renderScoreConnection();
     $('dashboardBody').hidden=!state.model;
