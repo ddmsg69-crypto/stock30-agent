@@ -390,6 +390,11 @@
         if(same && same.sha256!==files.lock.sha256)throw Error('MASTER와 공식 LOCK 충돌');
       }
       if(session!==scoreSession || request!==masterRequest)return;
+      // Local imports must not silently replace previously linked official results.
+      if(files.masterPointer && files.generation){
+        const candidate=previewModel(files,ids,[]);
+        rejectMasterLinkRegression(state.model,candidate);
+      }
       state.files=files;state.fileIds=ids;state.mode='local';state.scoreMode='snapshot';scoreSession.documents=[];assemble();updateConnection();
       scoreRequest++;masterRequest++;state.masterRaw=raws;state.masterCheckedAt=new Date().toISOString();state.masterAcceptedAt=state.masterCheckedAt;state.masterStatus='로컬 검증 PASS';renderMasterStatus();
       status(`${count}개 파일을 이 브라우저 안에서 읽었습니다.${state.model?' 검증된 데이터로 대시보드를 표시합니다.':' MASTER 포인터·생성본 두 파일이 필요합니다.'}`);
