@@ -11,7 +11,8 @@
 <script defer src="https://accounts.google.com/gsi/client"></script>
 <script defer src="https://apis.google.com/js/api.js"></script>
 <script defer src="./stock30-web-today.js?v=20261026"></script>
-<script defer src="./stock30-private.js?v=20261026"></script>
+<script defer src="./stock30-web-morning.js?v=20261028"></script>
+<script defer src="./stock30-private.js?v=20261028a"></script>
 </head>
 <body>
 <header class="topbar">
@@ -60,12 +61,18 @@
     <p id="scoreFixedState" class="muted"></p>
     <p class="muted">고정 누적 파일은 최초 한 번 Picker에서 승인하면 이후 로그인·MASTER 새로고침 때 같은 파일만 확인합니다. 기존 일별 스냅샷은 연결 관리의 보조 데이터에서 계속 선택할 수 있습니다. 파일 접근이 해제되면 다시 로그인하거나 Picker에서 재선택해 주세요.</p>
   </section>
+  <section class="card refresh-status" aria-label="아침 공식30 자동 전환"><strong>오전 09:00 공식 30종 자동 전환</strong>
+    <p id="morningStatus" role="status" aria-live="polite">로그인 후 고정 WEB_TODAY.json 최초 1회 선택</p>
+    <button class="thin-btn" id="pickWebTodayBtn" type="button" disabled>아침 자동 연결 파일 선택 (최초 1회)</button>
+    <button class="thin-btn" id="retryWebTodayBtn" type="button" disabled>↻ 오늘 공식30 확인</button>
+    <p class="muted">08:30 Work에서 검증된 공식 LOCK을 별도 비공개 파일로 게시합니다. 09:00부터 오늘 30종과 TOP5를 표시하며, 성과·가격은 검증된 장마감 MASTER만 사용합니다. 게시가 지연되면 이전 정상본을 표시하고 대기 사유를 알립니다.</p>
+  </section>
   <section class="card refresh-status" aria-label="공식 데이터 갱신 상태"><p id="masterRefreshStatus" role="status" aria-live="polite">MASTER 미연결</p><p class="muted">표시 중인 탭은 5분마다 확인합니다. 점수 연결 상태는 공식 성과 갱신과 별도로 표시됩니다.</p></section>
   <div class="kpi-grid" id="summary" aria-label="검증 성과 개요"></div>
   <div class="main-grid">
     <section class="card terminal">
       <nav class="tabs" id="tabs" aria-label="대시보드 탭">
-        <button type="button" class="active" data-tab="stocks">MASTER 선정 30종</button><button type="button" data-tab="reasons">선정 이유</button><button type="button" data-tab="top5">TOP5</button><button type="button" data-tab="days">DAY별 성과</button><button type="button" data-tab="learning">학습 데이터</button>
+        <button type="button" class="active" data-tab="stocks">공식 선정 30종</button><button type="button" data-tab="reasons">선정 이유</button><button type="button" data-tab="top5">TOP5</button><button type="button" data-tab="days">DAY별 성과</button><button type="button" data-tab="learning">학습 데이터</button>
       </nav>
       <div class="controls"><div class="filters" id="filters"></div><div class="right-tools"><input id="search" type="search" placeholder="종목명·코드 검색" aria-label="종목 검색"><select id="sort" aria-label="정렬"><option value="rank">선정 순위</option><option value="total" disabled>종합점수순 (미수집)</option><option value="chart">차트점수순</option><option value="momentum">모멘텀순</option><option value="light">LIGHT 점수순</option><option value="mfe">MFE순</option></select></div></div>
       <div id="content" class="tab-content"></div>

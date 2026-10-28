@@ -14,10 +14,12 @@
   const k = (obj,key) => obj && Object.prototype.hasOwnProperty.call(obj,key) ? obj[key] : undefined;
   const EMPTY = Object.freeze({masterPointer:null,generation:null,lock:null,scoreSnapshot:null});
   const web = window.Stock30WebToday;
+  const morning = window.Stock30WebMorning;
   const state = {
     token:'',email:'',config:null,pickerLoaded:false,files:{...EMPTY},fileIds:{},mode:'none',refreshing:false,
     model:null,tab:'stocks',filter:'all',search:'',sort:'rank',selectedKey:'',selectedCohort:'',error:'',scoreMode:'snapshot',
-    masterRaw:null,masterStatus:'미연결',masterCheckedAt:'',masterAcceptedAt:'',lastAutoCheck:0
+    masterRaw:null,masterStatus:'미연결',masterCheckedAt:'',masterAcceptedAt:'',lastAutoCheck:0,
+    today:null,todayStatus:'오늘 공식30 연결 미설정',todayCheckedAt:'',todayRefreshing:false,lastTodayCheck:0
   };
   const SCOPE = 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email';
   // Public web-OAuth client identifier (not a credential). Never embed secrets or access tokens.
@@ -82,6 +84,8 @@
     $('logoutBtn').addEventListener('click',signOut);
     $('pickPointerBtn').addEventListener('click',()=>openPicker('masterPointer'));
     $('refreshMasterBtn').addEventListener('click',()=>refreshCurrentMaster(true));
+    $('pickWebTodayBtn').addEventListener('click',()=>openPicker('webToday'));
+    $('retryWebTodayBtn').addEventListener('click',()=>pollWebToday(true));
     $('retryScoresBtn').addEventListener('click',()=>connectScores(true).catch(e=>showError('점수 연결',e)));
     $('pickFixedScoreBtn').addEventListener('click',()=>openPicker('fixedScore'));
     $('useSnapshotModeBtn').addEventListener('click',()=>useSnapshotMode().catch(e=>showError('점수 연결 방식',e)));
@@ -99,7 +103,9 @@
     });
     updateConnection();renderAll();
     setInterval(()=>{if(document.visibilityState==='visible')automaticRefresh()},300000);
-    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')automaticRefresh()});
+    // Check only one previously Picker-approved private Drive file ID. Before 09:00 cache but do not show.
+    setInterval(()=>{if(document.visibilityState==='visible')void pollWebToday()},60000);
+    document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){void automaticRefresh();void pollWebToday(true)}});
   }
   function renderMasterStatus(){
     const stamp=value=>value?new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul'})+' KST':'—';
@@ -110,6 +116,73 @@
     if(state.mode!=='drive'||document.visibilityState!=='visible'||state.refreshing)return;
     if(state.lastAutoCheck && Date.now()-state.lastAutoCheck<60000)return;
     state.lastAutoCheck=Date.now();await refreshCurrentMaster(false);
+  }
+  // MORNING VIEW ONLY: 09:00 official 30/TOP5, independent of the afternoon MASTER.
+  function morningCohort(){
+    return state.today?.date===morning.day(new Date()) && morning.canDisplay() ? state.today.cohort : null;
+  }
+  function renderMorningStatus(){
+    const el=$('morningStatus');if(!el)return;
+    const now=new Date(),day=morning.day(now),view=morningCohort();
+    const last=state.today?.date && state.today.date!==day?` · 마지막 정상 게시 ${state.today.date}`:'';
+    const label=!state.fileIds.webToday?'고정 WEB_TODAY.json 최초 1회 선택 필요':
+      view?`오늘 ${day} 공식30 · 09:00 전환 가능 · ${state.todayStatus}`:
+      state.today?.date===day?`오늘 ${day} 게시본 검증 완료 · 09:00 자동 전환 대기`:
+      `오늘 ${day} 공식30 게시 대기 · ${state.todayStatus}${last}`;
+    el.textContent=label;
+    $('pickWebTodayBtn').disabled=!state.token || !state.model;
+    $('retryWebTodayBtn').disabled=!state.token || !state.model || !state.fileIds.webToday || state.todayRefreshing;
+  }
+  function activateMorningIfReady(){
+    if(!morningCohort() || state.today.activated || !state.model)return false;
+    state.today.activated=true;
+    state.selectedCohort=state.today.date;
+    state.selectedKey='';state.tab='stocks';state.filter='all';
+    return true;
+  }
+  async function acceptMorning(raw){
+    if(!state.model)throw Error('검증된 MASTER 연결을 먼저 확인해 주세요.');
+    const verified=await morning.validate(raw,web);
+    const existing=state.model.master.locked_selections.find(c=>c.selection_date===verified.date);
+    if(existing && web.fingerprint(existing)!==web.fingerprint(verified.lock))throw Error('MASTER와 오늘 공식 LOCK 충돌');
+    if(state.today?.date===verified.date && state.today.sourceHash!==verified.sourceHash)throw Error('동일 선정일 공식 LOCK 원본 변경 감지');
+    if(state.today?.date>verified.date)throw Error('아침 공식 LOCK 날짜 역행 차단');
+    const isSame=state.today?.date===verified.date && state.today.sourceHash===verified.sourceHash;
+    if(!isSame){
+      const previous={today:state.today,cohort:state.selectedCohort,key:state.selectedKey,tab:state.tab,filter:state.filter};
+      try{
+        state.today={...verified,cohort:morning.cohort(verified),activated:false};
+        state.todayStatus='원본 해시 PASS · 30종·TOP5 정상';
+        activateMorningIfReady();renderAll();
+      }catch(e){
+        state.today=previous.today;state.selectedCohort=previous.cohort;
+        state.selectedKey=previous.key;state.tab=previous.tab;state.filter=previous.filter;
+        try{renderAll()}catch(_){}
+        throw e;
+      }
+    }else if(activateMorningIfReady())renderAll();
+    state.todayCheckedAt=new Date().toISOString();renderMorningStatus();
+    return true;
+  }
+  async function pollWebToday(force=false){
+    if(!morning || !state.token || Date.now()>=tokenExpiry || !state.model ||
+       state.mode!=='drive' || !state.fileIds.webToday || state.todayRefreshing)return;
+    if(!force && state.lastTodayCheck && Date.now()-state.lastTodayCheck<50000)return;
+    state.lastTodayCheck=Date.now();state.todayRefreshing=true;
+    const session=scoreSession,id=state.fileIds.webToday;
+    try{
+      const raw=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`,'morning_lock',0,true);
+      if(session!==scoreSession || state.fileIds.webToday!==id)return;
+      await acceptMorning(raw);
+    }catch(e){
+      if(session!==scoreSession || state.fileIds.webToday!==id)return;
+      const unavailable=e?.status===403||e?.status===404;
+      state.todayStatus=unavailable?'접근 권한 확인 필요 · 고정 파일을 Picker에서 다시 선택':
+        /다른 날짜의 게시본/.test(String(e?.message))?'Work 아침 게시 대기':
+        `조회 보류 · ${safeError(e)}`;
+      // Never remove a previously verified same-day view, and never pretend yesterday is today.
+      renderMorningStatus();
+    }finally{if(session===scoreSession){state.todayRefreshing=false;renderMorningStatus();}}
   }
   function startScoreRefresh(force=false){
     // Optional I/O never holds the MASTER refresh lock or delays its accepted screen.
@@ -136,8 +209,8 @@
     try{
       state.files=files;state.fileIds=ids;state.mode=mode;
       state.masterRaw={pointer:pointerRaw,generation:generationRaw};state.model=candidate;
-      if(candidate.cohorts.at(-1)?.date>previousLatest)state.selectedCohort=candidate.cohorts.at(-1).date;
-      if(!candidate.cohorts.some(c=>c.date===state.selectedCohort))state.selectedCohort=candidate.cohorts.at(-1)?.date||'';
+      if(candidate.cohorts.at(-1)?.date>previousLatest && state.selectedCohort!==state.today?.date)state.selectedCohort=candidate.cohorts.at(-1).date;
+      if(!candidate.cohorts.some(c=>c.date===state.selectedCohort) && state.selectedCohort!==state.today?.date)state.selectedCohort=candidate.cohorts.at(-1)?.date||'';
       if(!findStock(state.selectedKey))state.selectedKey='';
       state.masterCheckedAt=new Date().toISOString();if(changed)state.masterAcceptedAt=state.masterCheckedAt;
       state.masterStatus=changed?'자동 갱신 PASS':'최신 정상본 확인';
@@ -157,7 +230,7 @@
     const connected=!!state.token && Date.now()<tokenExpiry;
     $('loginBtn').disabled=connected;
     $('logoutBtn').disabled=!connected;
-    ['pickPointerBtn','pickGenerationBtn','pickExtraBtn','pickFixedScoreBtn'].forEach(id=>$(id).disabled=!connected);
+    ['pickPointerBtn','pickGenerationBtn','pickExtraBtn','pickFixedScoreBtn','pickWebTodayBtn'].forEach(id=>$(id).disabled=!connected);
     $('loginState').textContent=connected?'연결됨':'대기';
     $('authUser').textContent=connected?`Google: ${state.email || '계정 확인 중'}`:state.mode==='local'?'로컬 파일 읽기 모드':'Google 로그인 필요';
     $('welcomePanel').hidden=connected||!!state.model;
@@ -251,7 +324,7 @@
       const view=new google.picker.DocsView(google.picker.ViewId.DOCS).setIncludeFolders(true).setSelectFolderEnabled(false).setMode(google.picker.DocsViewMode.LIST);
       const picker=new google.picker.PickerBuilder()
         .addView(view).setOAuthToken(state.token).setDeveloperKey(cfg.apiKey).setAppId(cfg.projectNumber)
-        .setOrigin(window.location.origin).setTitle(kind==='masterPointer'?'master_current.json 선택':kind==='generation'?'master21_generation_*.json 선택':kind==='fixedScore'?'웹 전용 고정 누적 점수 JSON 선택':'공식 LOCK 또는 학습 점수 JSON 선택')
+        .setOrigin(window.location.origin).setTitle(kind==='webToday'?'아침 자동 30종 WEB_TODAY.json (최초 1회 선택)':kind==='masterPointer'?'master_current.json 선택':kind==='generation'?'master21_generation_*.json 선택':kind==='fixedScore'?'웹 전용 고정 누적 점수 JSON 선택':'공식 LOCK 또는 학습 점수 JSON 선택')
         .setCallback(data=>{
           if(data[google.picker.Response.ACTION]!==google.picker.Action.PICKED)return;
           const list=data[google.picker.Response.DOCUMENTS]||[];
@@ -267,6 +340,12 @@
     const session=scoreSession,request=['masterPointer','generation'].includes(kind)?++masterRequest:masterRequest;
     try{
       status(`${name||'선택한 파일'} 읽는 중...`);
+      if(kind==='webToday'){
+        if(name && name!=='WEB_TODAY.json')throw Error('아침 자동 연결 파일명이 WEB_TODAY.json이 아닙니다.');
+        const raw=await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`,'morning_selected',0,true);
+        ensureSession(session);await acceptMorning(raw);ensureSession(session);
+        state.fileIds={...state.fileIds,webToday:id};rememberFiles();renderMorningStatus();return;
+      }
       if(kind==='fixedScore'){
         const document=await readFixedScore(id,session);ensureSession(session);
         await connectScores(false,{files:{...state.files,scoreSnapshot:document.data},ids:{...state.fileIds,fixedScore:id},mode:'drive',scoreMode:'fixed',documents:[document],fixedDocument:document});return;
@@ -333,6 +412,8 @@
       const ids={...cached.ids,masterPointer:cached.ids.masterPointer,generation:pointer.location};
       if(!await acceptMaster(pointerRaw,generationRaw,ids,'drive',session,request))return;
       state.scoreMode=cached.scoreMode==='fixed'?'fixed':'snapshot';rememberFiles();startScoreRefresh();
+      // The 08:30 Work publisher updates this exact same previously approved file ID.
+      void pollWebToday(true);
       if(ids.lock){try{
         const raw=await fetchId(ids.lock);ensureSession(session);const lock=await validateLock(raw);ensureSession(session);
         if(request!==masterRequest)return;
@@ -400,7 +481,7 @@
       status(`${count}개 파일을 이 브라우저 안에서 읽었습니다.${state.model?' 검증된 데이터로 대시보드를 표시합니다.':' MASTER 포인터·생성본 두 파일이 필요합니다.'}`);
     }catch(e){if(session===scoreSession && request===masterRequest){state.files=previous.files;state.fileIds=previous.ids;state.model=previous.model;state.mode=previous.mode;state.scoreMode=previous.scoreMode;scoreSession.documents=previous.documents;state.selectedCohort=previous.cohort;state.selectedKey=previous.key;renderAll();showError('로컬 JSON 읽기',e)}}finally{event.target.value=''}
   }
-  function clearData(){scoreSession=newScoreSession();masterRequest++;scoreRequest++;state.masterRaw=null;state.masterStatus='미연결';state.masterCheckedAt='';state.masterAcceptedAt='';state.lastAutoCheck=0;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';state.scoreMode='snapshot';renderAll();updateConnection()}
+  function clearData(){state.today=null;state.todayStatus='오늘 공식30 연결 미설정';state.todayCheckedAt='';state.todayRefreshing=false;state.lastTodayCheck=0;scoreSession=newScoreSession();scoreRequest++;state.masterRaw=null;state.masterStatus='미연결';state.masterCheckedAt='';state.masterAcceptedAt='';state.lastAutoCheck=0;pendingPointer=null;state.refreshing=false;state.files={...EMPTY};state.fileIds={};state.model=null;state.selectedKey='';state.selectedCohort='';state.mode='none';state.scoreMode='snapshot';renderAll();updateConnection()}
   function safeParse(s,name){try{return JSON.parse(s)}catch(_){throw Error(`${name} 내부 JSON 파싱 실패`)}}
   function scoreDocuments(files=state.files,ids=state.fileIds,documents=scoreSession.documents){
     const result=[...documents];
@@ -777,11 +858,12 @@
     const latest=cohorts.at(-1);
     state.model={pointer:p,generation:g,master,board,momentum,top5reason,db,official,observations,legacy,cohorts,scores,masterByKey};
     if(render){$('workflowSection').classList.add('compact');$('toggleConnection').textContent='연결 관리 펼치기';$('settingsPanel').hidden=true;}
-    if(!state.selectedCohort || !cohorts.some(c=>c.date===state.selectedCohort))state.selectedCohort=latest?.date||'';
+    if(!state.selectedCohort || (!cohorts.some(c=>c.date===state.selectedCohort) && state.selectedCohort!==state.today?.date))state.selectedCohort=latest?.date||'';
     if(!findStock(state.selectedKey))state.selectedKey='';
     if(render)renderAll();
   }
-  function currentCohort(){return state.model?.cohorts.find(x=>x.date===state.selectedCohort)||state.model?.cohorts.at(-1)||null}
+  function currentCohort(){return state.model?.cohorts.find(x=>x.date===state.selectedCohort)||
+    (morningCohort()?.date===state.selectedCohort?morningCohort():null)||state.model?.cohorts.at(-1)||null}
   function currentStocks(){return currentCohort()?.stocks||[]}
   function findStock(key){if(!key)return null;return currentStocks().find(x=>x.date+'|'+x.code===key)||null}
   function chosen(){return findStock(state.selectedKey)||currentStocks()[0]||null}
@@ -898,6 +980,8 @@
     const stat=(title,value,desc,icon,vals)=>`<article class="card kpi"><div class="kpi-name"><em>${icon}</em>${h(title)}</div><div class="kpi-value">${h(value)}</div><div class="kpi-sub">${h(desc)}</div>${vals?.length?'<div class="kpi-graph">'+vals.map(v=>`<i data-bar="${Math.max(5,Math.min(100,Number(v)||0))}"></i>`).join('')+'</div>':''}</article>`;
     if(!m){$('summary').innerHTML=[stat('Hunter 확정 성공률','—','공식 검증 MASTER 필요','◎'),stat('종합점수','미수집','공식 종합점수 원천 필드 없음','♜'),stat('DAY별 성공현황','—','검증된 코호트 기록 없음','▥'),stat('ACTIVE 코호트','—','Drive 연결 대기','♧'),stat('TOP5 평균 MFE','—','관측값 없음','↗'),stat('TOP5 평균 MAE','—','관측값 없음','↘'),stat('운영 체크포인트','08:30','15:40 · 16:20 / 주문 0건','▤')].join('');setBars();return}
     const partitions=policyRates(m.official);const dayCounts=m.cohorts.map(c=>c.stocks.filter(s=>s.record && resultType(s.record)==='SUCCESS').length);
+    const morningExtra=morningCohort()&&!m.cohorts.some(c=>c.date===state.today.date);
+    if(morningExtra)dayCounts.push(0);
     const activeDates=new Set(m.official.filter(x=>x.Status==='ACTIVE').map(r=>r.__date));
     const top=m.official.filter(r=>String(r.TOP5)==='True'||r.TOP5===true||String(r.TOP5)==='1');
     const mfe=top.map(x=>num(x['MFE %'])).filter(x=>x!==null);const mae=top.map(x=>num(x['MAE %'])).filter(x=>x!==null);
@@ -905,7 +989,7 @@
     $('summary').innerHTML=[
       stat('Hunter 확정 성공률','정책별',partitions.filter(p=>p.rows.length).map(p=>`${p.label} ${rateLabel(p.rows)}`).join(' · ')+' · CLOSED만 분모','◎'),
       stat('종합점수','미수집','공식 종합점수 원천 필드 없음 · LIGHT와 구분','♜'),
-      stat('DAY별 성공현황',`${m.cohorts.length} DAY`,`실제 관측 성공 ${m.official.filter(x=>resultType(x)==='SUCCESS').length}종 · 확정과 구분`,'▥',dayCounts.map(x=>x/30*100)),
+      stat('DAY별 성공현황',`${m.cohorts.length+(morningExtra?1:0)} DAY`,`실제 관측 성공 ${m.official.filter(x=>resultType(x)==='SUCCESS').length}종 · 확정과 구분`,'▥',dayCounts.map(x=>x/30*100)),
       stat('ACTIVE 코호트',String(activeDates.size),`공식 추적 ${m.official.length}종 · 별도 비공식 관측 ${m.observations.length}종 · LEGACY ${m.legacy.length}종`,'♧'),
       stat('TOP5 평균 MFE','정책별',partitions.filter(p=>p.rows.length).map(p=>{const a=p.rows.filter(r=>top.includes(r)).map(r=>num(r['MFE %'])).filter(x=>x!==null);return `${p.label} ${pct(avg(a))} (${a.length}종)`}).join(' · ')+' · 최종수익률 아님','↗'),
       stat('TOP5 평균 MAE','정책별',partitions.filter(p=>p.rows.length).map(p=>{const a=p.rows.filter(r=>top.includes(r)).map(r=>num(r['MAE %'])).filter(x=>x!==null);return `${p.label} ${pct(avg(a))} (${a.length}종)`}).join(' · '),'↘'),
@@ -949,7 +1033,8 @@
     $('content').innerHTML=`<p class="muted">해당 DAY TOP5 · 선정일 ${h(currentCohort()?.date)} · ${h(cohortPolicy(currentCohort()))} · MASTER ${h(state.model.pointer.as_of)}. 정책별 원본 성과를 보존합니다.</p>${list.map(s=>`<button class="reason-card" type="button" data-select="${h(stockKey(s))}"><b>${h(s.rank)} · ${h(s.name)} (${h(s.code)}) ${performanceBadge(s)}</b><p>${h(s.reason||'선정 이유 없음')}</p><p>${h(stockPolicy(s).label)} MFE: ${h(pct(s.record?.['MFE %']))}　MAE: ${h(pct(s.record?.['MAE %']))}　최초 도달: ${h(hitLabel(s.record))}</p>${observationHTML(s)}</button>`).join('')||'<div class="empty">TOP5 기록이 없습니다.</div>'}`;
   }
   function renderDays(){const m=state.model;
-    const cards=[...m.cohorts].reverse().map(c=>{
+    const extra=morningCohort()&&!m.cohorts.some(c=>c.date===state.today.date)?[morningCohort()]:[];
+    const cards=[...m.cohorts,...extra].reverse().map(c=>{
       const rs=c.stocks.map(x=>x.record).filter(r=>r?.__dataClass==='OFFICIAL_NEW_BASELINE'),seen=rs.filter(x=>resultType(x)==='SUCCESS').length;
       const fail=rs.filter(x=>String(x.Status).toUpperCase()==='CLOSED'&&resultType(x)==='FAIL').length,tracking=rs.filter(x=>resultType(x)==='TRACKING').length;
       const rate=finalRate(rs),obs=c.stocks.filter(x=>x.observation).length;
@@ -976,6 +1061,7 @@
   function renderAll(){
     if($('hunterPolicyLabel'))$('hunterPolicyLabel').textContent=currentCohort()?`표시 코호트 ${currentCohort().date} · ${cohortPolicy(currentCohort())}`:'Hunter:10/19까지 D+1~D+5 · 10/20부터 D0~D+4';
     renderMasterStatus();
+    renderMorningStatus();
     renderScoreConnection();
     $('dashboardBody').hidden=!state.model;
     document.querySelectorAll('#tabs [data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab));
