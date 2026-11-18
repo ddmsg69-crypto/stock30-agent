@@ -48,6 +48,17 @@
     requireValue(/^[0-9a-f]{64}$/.test(value.sha256||''),label+' SHA256 누락');
     const unsealed='{'+parts.filter(x=>x.key!=='sha256').map(x=>x.text).join(',')+'}';
     let valid=await digest(unsealed)===value.sha256;
+    // WEB_TODAY v1.1 has exactly these string fields, including the unmodified
+    // LOCK JSON string. Normalize only this envelope, never MASTER numbers.
+    const morningFields=['as_of','kind','official_lock','publication_status','published_at','schema_version','source_lock_sha256','sha256'];
+    if(!valid&&value.kind===KIND&&value.schema_version==='1.1'&&
+      ['PUBLISHED','OFFICIAL'].includes(value.publication_status)&&
+      parts.length===morningFields.length&&morningFields.every(k=>typeof value[k]==='string')&&
+      parts.every(x=>morningFields.includes(x.key))){
+      const canonical='{'+morningFields.filter(k=>k!=='sha256').sort()
+        .map(k=>JSON.stringify(k)+':'+JSON.stringify(value[k])).join(',')+'}';
+      valid=await digest(canonical)===value.sha256;
+    }
     // Official LOCK exports may be pretty-printed. Its schema contains only
     // strings, booleans and integer ranks. Keep raw bytes outside this verifier;
     // never normalize numeric spelling in MASTER generations or Python floats.

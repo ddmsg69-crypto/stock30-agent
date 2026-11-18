@@ -16,7 +16,7 @@
     if(!verify || typeof verify.sealed!=='function' || typeof verify.official!=='function')throw Error('공식 LOCK 검증 모듈 미연결');
     if(typeof raw!=='string' || new TextEncoder().encode(raw).length>512*1024)throw Error('웹 아침 게시본 크기/형식 오류');
     const p=await verify.sealed(raw,'아침 WEB_TODAY');
-    if(p.kind!==KIND || p.schema_version!==VERSION || p.publication_status!=='PUBLISHED')throw Error('아침 WEB_TODAY 운영 게시 상태 오류');
+    if(p.kind!==KIND || p.schema_version!==VERSION || !['PUBLISHED','OFFICIAL'].includes(p.publication_status))throw Error('아침 WEB_TODAY 운영 게시 상태 오류');
     if(p.as_of!==day(now))throw Error('아침 공식30 게시 대기 · 다른 날짜의 게시본');
     if(typeof p.official_lock!=='string' || p.official_lock.length>128*1024)throw Error('공식 LOCK 원문 누락/초과');
     if(typeof p.source_lock_sha256!=='string'|| !/^[a-f0-9]{64}$/.test(p.source_lock_sha256))throw Error('공식 LOCK 출처 해시 누락');
